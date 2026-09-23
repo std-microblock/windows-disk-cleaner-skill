@@ -77,7 +77,8 @@ clippy -D warnings 和 prettier --check。
 
     node scripts/package-skill.mjs     # dist/windows-disk-cleaner/：skill 源码 + Release 程序 + 许可
     node scripts/archive-skill.mjs     # dist/windows-disk-cleaner-skill.zip + dist/SHA256SUMS.txt
-    node scripts/install-skill.mjs     # 安装到本机 skill 目录（默认 ~/.agents/skills，--dest 可改）
+    node scripts/install-skill.mjs     # 安装 dist/ 里的本地构建（默认 ~/.agents/skills，--dest 可改）
+    node scripts/install-skill.mjs --release latest --force   # 直接从 GitHub Release 装最新版（自动校验 SHA256SUMS）
 
 审阅默认直接读卷原始索引（NTFS/ReFS，2 个并发读句柄；4.27M 条目的系统盘约 13–18 秒），
 同卷多个目标只读一次；重复审阅用已保存的索引，毫秒级：
