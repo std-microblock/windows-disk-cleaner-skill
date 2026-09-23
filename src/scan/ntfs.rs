@@ -159,12 +159,19 @@ fn fixup(record: &mut [u8], sector: usize) -> Result<()> {
     let seq = [record[offset], record[offset + 1]];
     for i in 1..count {
         let tail = i * sector - 2;
-        ensure!(
-            record[tail..tail + 2] == seq,
-            "torn/live-changing MFT record (USA mismatch)"
-        );
         let repl = [record[offset + i * 2], record[offset + i * 2 + 1]];
-        record[tail..tail + 2].copy_from_slice(&repl);
+        // FSCTL_GET_NTFS_FILE_RECORD may return either the on-disk record
+        // (USA sequence still at each sector tail) or a record whose USA has
+        // already been applied. Accept both forms, but reject a genuinely
+        // torn/live-changing record.
+        if record[tail..tail + 2] == seq {
+            record[tail..tail + 2].copy_from_slice(&repl);
+        } else {
+            ensure!(
+                record[tail..tail + 2] == repl,
+                "torn/live-changing MFT record (USA mismatch)"
+            );
+        }
     }
     Ok(())
 }
@@ -478,9 +485,18 @@ pub fn scan_raw(
     memory_limit: u64,
 ) -> Result<Snapshot> {
     let mut boot = [0; 512];
-    raw.read_exact_at(0, &mut boot)?;
-    let g = Geometry::parse(&boot)?;
-    let (extents, length) = mft_extents(raw, &g)?;
+    if let Err(error) = raw.read_exact_at(0, &mut boot) {
+        #[cfg(windows)]
+        {
+            return scan_via_file_records(raw, volume, threads, memory_limit).with_context(|| {
+                format!("raw sector path unavailable ({error:#}); MFT control-code fallback failed")
+            });
+        }
+        #[cfg(not(windows))]
+        return Err(error).context("read NTFS boot sector");
+    }
+    let g = Geometry::parse(&boot).context("parse NTFS boot sector")?;
+    let (extents, length) = mft_extents(raw, &g).context("read NTFS MFT metadata")?;
     let mut s = Snapshot::new(volume.root.clone(), volume.clone(), "ntfs-mft", threads);
     let mut parents: Vec<(u32, u64)> = Vec::new();
     let mut dirs = AHashMap::new();
@@ -608,6 +624,57 @@ pub fn scan_raw(
     }
     s.stats.raw_bytes_read = length;
     s.stats.warnings.push("Live metadata, not an atomic filesystem snapshot. Hardlink allocations are charged once; alternate DATA streams included. Reparse points are not followed.".into());
+    s.finish()?;
+    Ok(s)
+}
+
+#[cfg(windows)]
+fn scan_via_file_records(
+    raw: &RawReader,
+    volume: &VolumeInfo,
+    threads: usize,
+    memory_limit: u64,
+) -> Result<Snapshot> {
+    let data = raw.ntfs_volume_data()?;
+    let record_size =
+        usize::try_from(data.BytesPerFileRecordSegment).context("invalid NTFS file record size")?;
+    let total = u64::try_from(data.MftValidDataLength)
+        .context("invalid NTFS MFT length")?
+        .checked_div(record_size as u64)
+        .context("invalid NTFS MFT record count")?;
+    ensure!(
+        (512..=65536).contains(&record_size),
+        "invalid NTFS file record size {record_size}"
+    );
+    let mut s = Snapshot::new(
+        volume.root.clone(),
+        volume.clone(),
+        "ntfs-file-record",
+        threads,
+    );
+    let mut parents = Vec::new();
+    let mut dirs = AHashMap::new();
+    for index in 0..total {
+        match raw.file_record(index, record_size) {
+            Ok(mut bytes) => match parse_record(&mut bytes, index, data.BytesPerSector as usize) {
+                Ok(Some(record)) => add_record(record, &mut s, &mut parents, &mut dirs)?,
+                Ok(None) => {}
+                Err(error) => s.warn(error.to_string()),
+            },
+            Err(_) => {}
+        }
+        if s.index_bytes() > memory_limit {
+            bail!("MFT index memory budget exceeded; use --max-memory-mib");
+        }
+        s.stats.records_read += 1;
+    }
+    for (node, frn) in parents.iter().copied() {
+        if let Some(parent) = dirs.get(&frn) {
+            s.nodes[node as usize].parent = *parent;
+        }
+    }
+    s.stats.raw_bytes_read = u64::try_from(data.MftValidDataLength).unwrap_or(0);
+    s.warn("Used FSCTL_GET_NTFS_FILE_RECORD fallback because raw sector reads are unsupported on this volume".to_string());
     s.finish()?;
     Ok(s)
 }
