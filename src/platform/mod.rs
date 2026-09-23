@@ -1,5 +1,5 @@
 //! Narrow, read-only Win32 metadata helpers. Destructive APIs live in deletion.rs.
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use std::os::windows::{
@@ -15,9 +15,14 @@ use std::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::*,
-    Storage::FileSystem::*,
-    System::{IO::DeviceIoControl, Ioctl::*, ProcessStatus::*, Threading::GetCurrentProcess},
+    Foundation::{CloseHandle, *},
+    Storage::FileSystem::{ReadFile, *},
+    System::{
+        IO::{DeviceIoControl, GetOverlappedResult, OVERLAPPED},
+        Ioctl::*,
+        ProcessStatus::*,
+        Threading::{CreateEventW, GetCurrentProcess, INFINITE, WaitForSingleObject},
+    },
 };
 
 pub mod elevation;
@@ -480,33 +485,32 @@ impl RawReader {
     #[cfg(windows)]
     pub fn volume(info: &VolumeInfo) -> Result<Self> {
         elevation::require_administrator()?;
+        // GetVolumeNameForVolumeMountPointW returns a `\\?\Volume{GUID}\`
+        // path. That is a mount-point name, but it is not accepted as a raw
+        // volume handle by CreateFile on some Windows builds (ERROR_NOT_SUPPORTED
+        // / 50). Use the DOS volume device form for drive-letter volumes, which
+        // is the form used by tools such as WizTree and Everything.
+        let device = info
+            .root
+            .to_str()
+            .and_then(|root| root.strip_suffix("\\").or(Some(root)))
+            .filter(|root| root.len() == 2 && root.as_bytes()[1] == b':')
+            .map(|root| format!(r"\\.\{root}"))
+            .unwrap_or_else(|| info.device.clone());
         let file = OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .open(&info.device)
-            .with_context(|| {
-                format!(
-                    "read-only raw volume {} (administrator required)",
-                    info.device
-                )
-            })?;
-        let mut length = 0i64;
-        let mut returned = 0;
-        if unsafe {
-            DeviceIoControl(
-                file.as_raw_handle(),
-                IOCTL_DISK_GET_LENGTH_INFO,
-                std::ptr::null(),
-                0,
-                (&mut length as *mut i64).cast(),
-                8,
-                &mut returned,
-                std::ptr::null_mut(),
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error()).context("query raw volume length");
-        }
+            // Raw volume reads require unbuffered I/O on Windows. All callers
+            // already align reads to the 512-byte sector boundary.
+            .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED)
+            .open(&device)
+            .with_context(|| format!("read-only raw volume {} (administrator required)", device))?;
+        // IOCTL_DISK_GET_LENGTH_INFO is not supported for volume handles on
+        // some Windows builds (ERROR_NOT_SUPPORTED / 50). The volume size was
+        // already obtained from GetDiskFreeSpaceExW, so use it as the raw-read
+        // boundary instead of rejecting an otherwise valid raw handle.
+        let length = info.total_bytes as i64;
+        ensure!(length > 0, "volume reports an invalid size");
         Ok(Self {
             file: std::sync::Mutex::new(file),
             length: length.max(0) as u64,
@@ -518,7 +522,6 @@ impl RawReader {
         bail!("raw volumes require Windows")
     }
     pub fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
-        use std::io::{Read, Seek, SeekFrom};
         if dst.is_empty() {
             return Ok(());
         }
@@ -530,21 +533,91 @@ impl RawReader {
         }
         let start = offset / self.alignment * self.alignment;
         let aligned_end = end.div_ceil(self.alignment) * self.alignment;
-        let mut f = self
+        let f = self
             .file
             .lock()
             .map_err(|_| anyhow::anyhow!("raw-reader mutex poisoned"))?;
-        f.seek(SeekFrom::Start(start))?;
-        if start == offset && aligned_end == end {
-            f.read_exact(dst)?;
-        } else {
-            let mut buf = vec![0u8; (aligned_end - start) as usize];
-            f.read_exact(&mut buf)?;
-            let i = (offset - start) as usize;
-            dst.copy_from_slice(&buf[i..i + dst.len()]);
+        let len = (aligned_end - start) as usize;
+        // FILE_FLAG_NO_BUFFERING requires the user buffer itself to be sector
+        // aligned; Vec<u8> and stack arrays only guarantee byte alignment.
+        let mut storage = vec![0u8; len + self.alignment as usize - 1];
+        let base = storage.as_ptr() as usize;
+        let aligned = (base + self.alignment as usize - 1) & !(self.alignment as usize - 1);
+        let aligned_buf = &mut storage[aligned - base..aligned - base + len];
+        #[cfg(windows)]
+        unsafe {
+            let event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+            anyhow::ensure!(
+                !event.is_null(),
+                "CreateEventW failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.hEvent = event;
+            ov.Anonymous.Anonymous.Offset = start as u32;
+            ov.Anonymous.Anonymous.OffsetHigh = (start >> 32) as u32;
+            let mut got = 0u32;
+            let ok = ReadFile(
+                f.as_raw_handle(),
+                aligned_buf.as_mut_ptr().cast(),
+                len as u32,
+                &mut got,
+                &mut ov,
+            );
+            let mut result = Ok(());
+            if ok == 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+                    result = Err(error).context("ReadFile raw volume");
+                } else {
+                    WaitForSingleObject(event, INFINITE);
+                    if GetOverlappedResult(f.as_raw_handle(), &mut ov, &mut got, 1) == 0 {
+                        result = Err(std::io::Error::last_os_error())
+                            .context("GetOverlappedResult raw volume");
+                    }
+                }
+            }
+            CloseHandle(event);
+            result?;
+            anyhow::ensure!(
+                got as usize == len,
+                "short raw volume read: {} of {} bytes",
+                got,
+                len
+            );
         }
+        #[cfg(not(windows))]
+        unreachable!();
+        let i = (offset - start) as usize;
+        dst.copy_from_slice(&aligned_buf[i..i + dst.len()]);
         Ok(())
     }
+    #[cfg(windows)]
+    pub fn ntfs_volume_data(&self) -> Result<NTFS_VOLUME_DATA_BUFFER> {
+        let f = self
+            .file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("raw-reader mutex poisoned"))?;
+        let mut data: NTFS_VOLUME_DATA_BUFFER = unsafe { std::mem::zeroed() };
+        let mut returned = 0u32;
+        if unsafe {
+            DeviceIoControl(
+                f.as_raw_handle(),
+                FSCTL_GET_NTFS_VOLUME_DATA,
+                std::ptr::null(),
+                0,
+                (&mut data as *mut NTFS_VOLUME_DATA_BUFFER).cast(),
+                std::mem::size_of_val(&data) as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("FSCTL_GET_NTFS_VOLUME_DATA");
+        }
+        Ok(data)
+    }
+
     #[cfg(windows)]
     pub fn file_record(&self, record: u64, record_size: usize) -> Result<Vec<u8>> {
         let f = self
