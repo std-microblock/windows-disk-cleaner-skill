@@ -1,4 +1,4 @@
 interface:
   display_name: "Windows 磁盘清理"
-  short_description: "快速扫描 NTFS / ReFS，核查 Git 风险，只标记清理目标并交由用户确认"
-  default_prompt: "使用 $windows-disk-cleaner 分析磁盘占用，核查候选目录的 Git 风险；拿不准能否删除的先问我，只标记清理目标并让我在窗口中确认。"
+  short_description: "先选清理范围，再核查风险；只标记选中目标并交由用户确认"
+  default_prompt: "使用 $windows-disk-cleaner 分析磁盘占用；只要求分析时保持只读。若要清理而我未指明对象，先问我想处理的类别、应用或路径，只读列候选，不要默认标记缓存或其他目录。核查我选定的具体目标并征得确认后才标记；服务、数据库、虚拟磁盘和模型存储须先查使用记录，确认后用 --critical 标记。最后由我在窗口中勾选确认删除。"

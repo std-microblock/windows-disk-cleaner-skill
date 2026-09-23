@@ -34,10 +34,12 @@ all_content_synced=true 才是本次审计没有发现工作区本地数据、�
 
 ## 标记与用户审阅
 
+以下 rm 命令只是示例；应先核查目标并取得用户对具体路径的明确同意，不得直接照搬示例理由。
+
     disk-cleaner.exe rm -rf D:/Projects/app/target --reason "可重建的编译产物，保留源代码"
     disk-cleaner.exe rm C:/Users/Example/Downloads/archive.zip --reason "用户确认已解压且不再需要"
-    disk-cleaner.exe rm -rf D:/Cache/junk --reason "过期缓存，可重建" --warn "不确定是否仍被本地脚本引用，删前再看一眼"
-    disk-cleaner.exe rm D:/Data/models --reason "用户明确同意删除" --critical "无法核实是否含唯一产物，删除不可恢复"
+    disk-cleaner.exe rm -rf D:/Cache/junk --reason "用户确认只清理此应用的可重建缓存" --warn "删除后需重新下载；用户确认不依赖离线缓存"
+    disk-cleaner.exe rm -rf D:/Data/models --reason "核查服务引用和备份后，用户确认该模型存储不再需要" --critical "模型及可能的本地数据将永久删除；已与用户确认具体范围"
     disk-cleaner.exe undo-rm D:/Projects/app/target
     disk-cleaner.exe undo-rm --all
     disk-cleaner.exe show-rm --text
@@ -47,7 +49,7 @@ all_content_synced=true 才是本次审计没有发现工作区本地数据、�
     disk-cleaner.exe show-rm --index fs
 
 - `--warn TEXT` / `--critical TEXT` 可重复，附加到本次 rm 标记的目标；只做提示和高亮，不阻止删除，也不算用户确认。
-- 不确定能否删除的对象，先问用户再标记（见 SKILL.md 流程 4）；没有明确答复就不要标记，也不要把猜测写进 reason 当结论。
+- 未指明对象或只指定宽泛类别时，先问清具体范围（见 SKILL.md）；不确定能否删除的对象，先问用户再标记。没有明确答复就不要标记，也不要把猜测写进 reason 当结论；`--critical` 也不能代替同意。
 - -reason 兼容旧例子，推荐 --reason。
 - -f 仅忽略不存在的路径，不跳过任何确认；-r 仅允许标记文件夹。
 - 不支持通配符、ADS 路径、设备路径、卷根、受保护的 OS 路径，或穿越 junction/symlink 的父目录。
