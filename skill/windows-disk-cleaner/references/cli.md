@@ -5,20 +5,22 @@
 ## 查看与扫描
 
     disk-cleaner.exe doctor --json
-    disk-cleaner.exe scan D:/ --backend ntfs --threads 8 --save .disk-cleaner/D.dcscan
-    disk-cleaner.exe scan E:/ --backend refs --threads 8 --save .disk-cleaner/E.dcscan
+    disk-cleaner.exe scan D:/ --backend ntfs --threads 8 --elevate --save .disk-cleaner/D.dcscan
+    disk-cleaner.exe scan E:/ --backend refs --threads 8 --elevate --save .disk-cleaner/E.dcscan
     disk-cleaner.exe scan C:/Users/Example/Downloads --backend fs --threads 8
     disk-cleaner.exe detail D:/Projects --snapshot .disk-cleaner/D.dcscan --depth 2
     disk-cleaner.exe detail D:/Projects/app/target --snapshot .disk-cleaner/D.dcscan --min-size 0 --top 20
 
-- 默认 auto；NTFS/ReFS 严格后端需要管理员权限，CLI 只提示，不自动提权。显式 ntfs/refs 失败不会静默改成 fs。
+- 默认 auto；NTFS/ReFS 严格后端需要管理员权限。加 --elevate 时 CLI 通过 Windows UAC 重新启动自身（一次弹窗），等待子进程并把它的输出原样回传；不加时严格后端直接失败并提示，绝不静默改成 fs。
 - NTFS 直接分块读取 MFT，ReFS 原始扫描当前限定 3.14。其他 ReFS 版本不宣称兼容，使用明确的 --backend fs。
 - --max-memory-mib 1024 限制索引预算；--buffer-mib 8 限制 MFT 批量读取；--threads 1..64。
 - --depth、--top、--min-size、--max-lines 只限制显示，不裁剪完整索引。
 - --metric allocated 默认按占用排序；logical 为逻辑长度。硬链接占用在索引内去重，名称仍保留。
 - --no-git 只跳过报告注释，绝不能关闭删除安全检查。
 - --no-save 用于一次性只读扫描；--json 提供有界结构化报告而不是海量文件全量输出。
-- detail 是缓存快照，可能过期；实际删除前 GUI 会重新枚举和验证文件身份。
+- detail 是缓存快照，可能过期；审阅窗口用 --snapshot 复用已有索引时同样可能过期。
+- show-rm 索引顺序：显式 --snapshot → 提权时的一次原始卷索引（NTFS/ReFS，按卷缓存）→ 未提权时的目录遍历（只读目录元数据，不做逐文件打开）。
+- 审阅树不含哈希；实际删除前对每个勾选对象重新打开防替换句柄，核对类型/大小/修改时间，变化过的对象跳过并报告。
 - 时间列同时显示 LATEST UTC (max) 与 OLDEST UTC (min)，文件夹统计后代文件、文件两者相同。v2 缓存可从保存的逐文件时间自动补算 max，不需要重新扫描；v1 缓存缺失时间，需重新扫描。
 - compare LEFT.dcscan RIGHT.dcscan --scope PATH 对照完整子树，而非屏幕截断的行。
 
@@ -38,6 +40,7 @@ all_content_synced=true 才是本次审计没有发现工作区本地数据、�
     disk-cleaner.exe show-rm --text
     disk-cleaner.exe show-rm --json
     disk-cleaner.exe show-rm
+    disk-cleaner.exe show-rm --snapshot .disk-cleaner/D.dcscan
 
 - -reason 兼容旧例子，推荐 --reason。
 - -f 仅忽略不存在的路径，不跳过任何确认；-r 仅允许标记文件夹。

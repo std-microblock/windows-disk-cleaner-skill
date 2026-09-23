@@ -29,6 +29,7 @@ struct State {
     lock_response: Option<SyncSender<LockDecision>>,
     cancel: Arc<AtomicBool>,
     path: PathBuf,
+    snapshot: Option<PathBuf>,
     sender: Sender<Event>,
     threads: usize,
 }
@@ -334,11 +335,12 @@ fn refresh(ui: &ReviewWindow, state: &Rc<RefCell<State>>, fetch: bool) {
     s.expanded.clear();
     s.selected = None;
     let path = s.path.clone();
+    let snapshot = s.snapshot.clone();
     let sender = s.sender.clone();
     let threads = s.threads;
     let cancel = s.cancel.clone();
-    std::thread::spawn(
-        move || match deletion::prepare(&path, fetch, threads, &sender) {
+    std::thread::spawn(move || {
+        match deletion::prepare(&path, snapshot.as_deref(), fetch, threads, &sender) {
             Ok(p) => {
                 if cancel.load(Ordering::Relaxed) {
                     let _ = sender.send(Event::Fatal("准备已停止，没有删除文件。".into()));
@@ -349,8 +351,8 @@ fn refresh(ui: &ReviewWindow, state: &Rc<RefCell<State>>, fetch: bool) {
             Err(e) => {
                 let _ = sender.send(Event::Fatal(format!("{e:#}")));
             }
-        },
-    );
+        }
+    });
 }
 fn begin_delete(ui: &ReviewWindow, state: &Rc<RefCell<State>>, git_ack: bool) {
     if ui.get_busy() || ui.get_preview() || !ui.get_reviewed() {
@@ -372,15 +374,14 @@ fn begin_delete(ui: &ReviewWindow, state: &Rc<RefCell<State>>, git_ack: bool) {
     s.cancel = Arc::new(AtomicBool::new(false));
     let cancel = s.cancel.clone();
     let tx = s.sender.clone();
-    let threads = s.threads;
     ui.set_modal_kind("".into());
     ui.set_busy(true);
     ui.set_deleting(true);
     ui.set_can_delete(false);
     ui.set_progress(0.);
-    ui.set_status("正在重新校验清单；通过后才会删除…".into());
+    ui.set_status("正在复核标记目录；随后逐项按句柄核对并删除".into());
     std::thread::spawn(
-        move || match deletion::execute(p, approval, cancel, tx.clone(), threads) {
+        move || match deletion::execute(p, approval, cancel, tx.clone()) {
             Ok(o) => {
                 let _ = tx.send(Event::Finished(o));
             }
@@ -390,7 +391,8 @@ fn begin_delete(ui: &ReviewWindow, state: &Rc<RefCell<State>>, git_ack: bool) {
         },
     );
 }
-pub fn run(path: &Path, fetch: bool) -> Result<()> {
+pub fn run(path: &Path, snapshot: Option<&Path>, fetch: bool) -> Result<()> {
+    let index = snapshot.map(Path::to_path_buf);
     let ui = ReviewWindow::new()?;
     let (tx, rx) = mpsc::channel();
     let path = platform::absolute(path)?;
@@ -404,6 +406,7 @@ pub fn run(path: &Path, fetch: bool) -> Result<()> {
         lock_response: None,
         cancel: Arc::new(AtomicBool::new(false)),
         path,
+        snapshot: index,
         sender: tx,
         threads: 8,
     }));
@@ -767,12 +770,7 @@ fn example_prepared() -> Prepared {
             git: None,
         };
         plan.targets.push(target.clone());
-        targets.push(PreparedTarget {
-            target,
-            identities: vec![Identity::default(); tree.nodes.len()],
-            tree,
-            digest: [0; 32],
-        });
+        targets.push(PreparedTarget { target, tree });
     }
     let total_items = targets.iter().map(|t| t.tree.nodes.len() as u64).sum();
     let allocated_upper_bound = targets.iter().map(|t| t.tree.nodes[0].allocated).sum();
@@ -834,6 +832,7 @@ pub fn preview(output: &Path, state_name: &str) -> Result<()> {
         selected,
         lock_response: None,
         cancel: Arc::new(AtomicBool::new(false)),
+        snapshot: None,
         path: PathBuf::new(),
         sender: tx,
         threads: 1,

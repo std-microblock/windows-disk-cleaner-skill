@@ -176,9 +176,9 @@ const fn crc64_tables() -> [[u64; 256]; 8] {
 const CRC64: [[u64; 256]; 8] = crc64_tables();
 fn crc64(data: &[u8]) -> u64 {
     let mut c = u64::MAX;
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
-        let x = c ^ u64::from_le_bytes(chunk.try_into().unwrap());
+    let (chunks, remainder) = data.as_chunks::<8>();
+    for chunk in chunks {
+        let x = c ^ u64::from_le_bytes(*chunk);
         c = CRC64[7][(x & 255) as usize]
             ^ CRC64[6][((x >> 8) & 255) as usize]
             ^ CRC64[5][((x >> 16) & 255) as usize]
@@ -188,7 +188,7 @@ fn crc64(data: &[u8]) -> u64 {
             ^ CRC64[1][((x >> 48) & 255) as usize]
             ^ CRC64[0][(x >> 56) as usize];
     }
-    for &b in chunks.remainder() {
+    for &b in remainder {
         c = (c >> 8) ^ CRC64[0][((c as u8) ^ b) as usize];
     }
     let c = c ^ u64::MAX;
@@ -519,8 +519,10 @@ fn entry(row: Row<'_>, parent_object: [u8; 16]) -> Result<Option<Entry>> {
         "odd UTF-16 filename length"
     );
     let name: Vec<u16> = row.key[4..]
-        .chunks_exact(2)
-        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| u16::from_le_bytes(*p))
         .collect();
     ensure!(
         !name.is_empty() && !name.contains(&0) && !name.contains(&47) && !name.contains(&92),

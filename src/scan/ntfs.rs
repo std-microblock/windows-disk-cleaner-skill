@@ -390,8 +390,10 @@ fn parse_record(record: &mut [u8], index: u64, sector: usize) -> Result<Option<R
                 ensure!(66 + n * 2 <= v.len(), "truncated FILE_NAME");
                 if v[65] != 2 {
                     let text = v[66..66 + n * 2]
-                        .chunks_exact(2)
-                        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|p| u16::from_le_bytes(*p))
                         .collect();
                     out.names.push(Name {
                         parent: u64at(v, 0)?,

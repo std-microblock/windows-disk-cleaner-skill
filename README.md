@@ -14,8 +14,9 @@ Rust CLI + 轻量 Slint Fluent 清理审阅窗口 + agent skill。
     .\target\release\disk-cleaner.exe scan D:/Projects --backend fs
     .\target\release\disk-cleaner.exe detail D:/Projects --snapshot .disk-cleaner/last.dcscan
 
-权限由调用方处理。CLI 不自动弹 UAC、不运行 gsudo、不配置常驻提权。
-普通 --backend fs 可在现有权限下运行；原始扫描权限不足时提示 agent 自行提权后重试。
+权限：加 --elevate 时 CLI 通过 Windows UAC 重新启动自身（每次一次弹窗，由用户同意），
+等待子进程并把它的输出原样回传；不加则保持当前权限，严格后端直接失败而不静默回退 fs。
+不运行 gsudo、不配置常驻提权或凭据缓存。
 
 默认 8 线程、8 MiB MFT 批次、1024 MiB 索引预算。完整 UTF-16 索引保存为带校验的
 .dcscan；top/depth/min-size/max-lines 只裁剪显示，不损失下钻精度。
@@ -30,7 +31,9 @@ Rust CLI + 轻量 Slint Fluent 清理审阅窗口 + agent skill。
 - 同盘目标合并为盘符根下的真实文件树，共享祖先合并；可展开、折叠、分页、全选/半选。
 - 每层显示待删大小、已选/总文件数；盘符和中间分组节点本身不会删除。
 - 未选子项和半选父目录保留。没有无头删除、--yes 或 force-delete。
-- 删除前重新枚举、比较文件身份/大小/时间，再以防替换句柄执行；重解析点不递归跟随。
+- 审阅树来自快速索引（提权时的原始 NTFS/ReFS 卷索引，或一次目录遍历），不含任何哈希。
+- 每个勾选对象在删除前重新打开防替换句柄（不共享写/删除），核对类型/大小/修改时间；变化过的对象跳过并报告。
+- 标记文件 clean-targets.json 只保存路径、理由、标记时间、对象身份与大小汇总；重解析点不递归跟随。
 - git2 检查工作树、所有本地分支/标签、stash、忽略项和未跟踪项；缓存 remote 不是远端证明。
 - Git 本地/未知风险由用户二次确认；占用使用 Restart Manager，用户单独决定是否关闭应用。
 - 关键服务/进程不会关闭；强制关闭需额外勾选。实时进度可停止，已删除内容不能恢复。
@@ -61,6 +64,10 @@ LATEST UTC (max) 是主要列，OLDEST UTC (min) 同时保留。
     node scripts/package-skill.mjs     # dist/windows-disk-cleaner/：skill 源码 + Release 程序 + 许可
     node scripts/archive-skill.mjs     # dist/windows-disk-cleaner-skill.zip + dist/SHA256SUMS.txt
     node scripts/install-skill.mjs     # 安装到本机 skill 目录（默认 ~/.agents/skills，--dest 可改）
+
+审阅可直接复用索引，不必重复扫描：
+
+    .\target\release\disk-cleaner.exe show-rm --snapshot .disk-cleaner/D.dcscan
 
 install-skill 只覆盖目标 skill 目录本身，不动其他 skill 或全局配置；目标已存在时需显式 --force。
 

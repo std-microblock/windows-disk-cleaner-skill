@@ -31,6 +31,22 @@ impl Default for ScanOptions {
         }
     }
 }
+/// Raw volume index for the review window. Needs administrator rights; callers
+/// fall back to a directory walk when this fails or the index is incomplete.
+pub fn volume_snapshot(
+    volume: &platform::VolumeInfo,
+    threads: usize,
+    buffer_mib: usize,
+    memory_limit: u64,
+) -> Result<Snapshot> {
+    if volume.filesystem.eq_ignore_ascii_case("NTFS") {
+        ntfs::scan(volume, threads, buffer_mib, memory_limit)
+    } else if volume.filesystem.eq_ignore_ascii_case("REFS") {
+        refs::scan(volume, threads, memory_limit)
+    } else {
+        bail!("no raw backend for {}", volume.filesystem)
+    }
+}
 pub fn scan(path: &Path, options: &ScanOptions) -> Result<Snapshot> {
     let start = Instant::now();
     let root = platform::canonical(path)?;

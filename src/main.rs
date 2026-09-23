@@ -24,9 +24,17 @@ struct Cli {
         help = "Deletion plan in the current working directory (JSON, never a command script)"
     )]
     plan: PathBuf,
-    // Compatibility with earlier examples; elevation is now always manual.
+    // Compatibility with earlier examples; only --elevate ever elevates.
     #[arg(long, global = true, hide = true)]
     no_elevate: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Relaunch this command through one Windows UAC prompt (needed for raw NTFS/ReFS scans); never implicit"
+    )]
+    elevate: bool,
+    #[arg(long, global = true, hide = true, value_name = "DIR")]
+    elevation_report: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -106,6 +114,11 @@ enum Command {
         json: bool,
         #[arg(long, help = "Verify live Git remotes during review preparation")]
         fetch: bool,
+        #[arg(
+            long,
+            help = "Index the review tree from this scan --save snapshot instead of scanning again"
+        )]
+        snapshot: Option<PathBuf>,
     },
 }
 #[derive(Args)]
@@ -172,6 +185,12 @@ fn output_json(value: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 fn run(cli: Cli) -> Result<i32> {
+    #[cfg(windows)]
+    if cli.elevate && cli.elevation_report.is_none() && !platform::elevation::is_elevated() {
+        return platform::elevation::relaunch_elevated();
+    }
+    #[cfg(not(windows))]
+    anyhow::ensure!(!cli.elevate, "--elevate is a Windows-only option");
     let command_started = Instant::now();
     if platform::elevation::is_elevated() {
         platform::elevation::enable_backup_privilege()?;
@@ -181,7 +200,7 @@ fn run(cli: Cli) -> Result<i32> {
             let volumes = platform::volumes();
             if json {
                 output_json(
-                    &serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"administrator":platform::elevation::is_elevated(),"elevation":"manual: caller/agent must obtain administrator rights","cwd":std::env::current_dir()?,"volumes":volumes,"deletion":"GUI confirmation only; rm is stage-only"}),
+                    &serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"administrator":platform::elevation::is_elevated(),"elevation":"--elevate asks Windows for one UAC prompt; nothing else elevates","cwd":std::env::current_dir()?,"volumes":volumes,"deletion":"GUI confirmation only; rm is stage-only"}),
                 )?;
             } else {
                 println!(
@@ -201,6 +220,9 @@ fn run(cli: Cli) -> Result<i32> {
                         v.device
                     );
                 }
+                println!(
+                    "elevation: raw NTFS/ReFS scans need administrator rights; pass --elevate for one UAC prompt. fs enumeration stays unprivileged."
+                );
                 println!("rm is STAGE ONLY. No headless/--yes/force-delete command exists.");
             }
         }
@@ -331,7 +353,12 @@ fn run(cli: Cli) -> Result<i32> {
             let n = plan::undo(&cli.plan, &paths, all)?;
             println!("Cancelled {n} mark(s). No content was deleted or restored.");
         }
-        Command::ShowRm { text, json, fetch } => {
+        Command::ShowRm {
+            text,
+            json,
+            fetch,
+            snapshot,
+        } => {
             if text || json {
                 let store = plan::Store::open(&cli.plan)?;
                 if json {
@@ -365,7 +392,7 @@ fn run(cli: Cli) -> Result<i32> {
                     println!(
                         "Opening human review. The agent must NOT click deletion/close-process confirmations."
                     );
-                    disk_cleaner::gui::run(&cli.plan, fetch)?;
+                    disk_cleaner::gui::run(&cli.plan, snapshot.as_deref(), fetch)?;
                 }
                 #[cfg(not(feature = "gui"))]
                 bail!(
@@ -386,6 +413,13 @@ fn main() {
         }
     });
     let cli = Cli::parse_from(args);
+    // Elevated child: report through files, since it may own no console at all.
+    if let Some(report) = cli.elevation_report.clone()
+        && let Err(e) = platform::elevation::redirect_output(&report)
+    {
+        eprintln!("ERROR: {e:#}");
+        std::process::exit(1);
+    }
     let code = match run(cli) {
         Ok(code) => code,
         Err(e) => {

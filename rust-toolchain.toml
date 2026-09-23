@@ -1,4 +1,5 @@
 [toolchain]
-channel = "stable"
+# Pinned so local builds and CI run the same rustc/clippy/rustfmt.
+channel = "1.92"
 profile = "minimal"
 components = ["rustfmt", "clippy"]

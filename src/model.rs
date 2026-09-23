@@ -26,6 +26,9 @@ pub fn oldest_known(a: i64, b: i64) -> i64 {
         a.min(b)
     }
 }
+fn mtime_of(node: &Node) -> Option<i64> {
+    (node.flags & MTIME_UNKNOWN == 0).then_some(node.oldest_modified_ms)
+}
 pub fn latest_known(a: i64, b: i64) -> i64 {
     if a == UNKNOWN_MTIME {
         b
@@ -180,6 +183,52 @@ impl Snapshot {
             p.push(platform::decode_name(self.name_units(i)));
         }
         p
+    }
+    /// Re-root this snapshot at `path`, keeping exactly that subtree. Directory
+    /// aggregates are rebuilt by finish(), so nothing is counted twice; the result
+    /// carries the source statistics, including any incompleteness.
+    pub fn subtree(&self, path: &Path) -> Result<Self> {
+        let found = self
+            .find(path)
+            .with_context(|| format!("{} is not part of this volume snapshot", path.display()))?;
+        let mut out = Self::new(
+            path.to_path_buf(),
+            self.volume.clone(),
+            &self.stats.backend,
+            self.stats.threads,
+        );
+        out.stats = self.stats.clone();
+        out.stats.records_read = 0;
+        let source_root = &self.nodes[found as usize];
+        out.nodes[0].flags = self.nodes[0].flags & INCOMPLETE
+            | source_root.flags & (DIR | REPARSE | ESTIMATED | VIRTUAL);
+        if !source_root.is_dir() {
+            out.nodes[0].logical = source_root.logical;
+            out.nodes[0].allocated = source_root.allocated;
+            out.set_file_mtime(0, mtime_of(source_root));
+        }
+        let mut queue: VecDeque<(u32, u32)> =
+            self.children(found).map(|child| (child, 0)).collect();
+        while let Some((source, parent)) = queue.pop_front() {
+            let node = &self.nodes[source as usize];
+            let is_dir = node.is_dir();
+            let id = out.push(
+                parent,
+                self.name_units(source),
+                if is_dir { 0 } else { node.logical },
+                if is_dir { 0 } else { node.allocated },
+                node.flags & (DIR | REPARSE | HARDLINK | ESTIMATED | VIRTUAL | MTIME_UNKNOWN),
+            )?;
+            if !is_dir {
+                out.set_file_mtime(id, mtime_of(node));
+            }
+            out.stats.records_read += 1;
+            if is_dir {
+                queue.extend(self.children(source).map(|child| (child, id)));
+            }
+        }
+        out.finish()?;
+        Ok(out)
     }
     pub fn children(&self, id: u32) -> Children<'_> {
         Children {

@@ -3,9 +3,9 @@
 use crate::{
     git_audit::{self, GitAudit},
     locks,
-    model::Snapshot,
+    model::{REPARSE, Snapshot, UNKNOWN_MTIME},
     plan::{self, Plan, Store, Target},
-    platform::{self, Identity, VolumeInfo},
+    platform::{self, VolumeInfo},
     scan,
     selection::TreeSelection,
 };
@@ -26,8 +26,29 @@ use std::{
 pub struct PreparedTarget {
     pub target: Target,
     pub tree: Snapshot,
-    pub identities: Vec<Identity>,
-    pub digest: [u8; 32],
+}
+/// What the human actually saw for one reviewed object: type, allocation and, for
+/// files, size and modification time. There is deliberately no content hash and no
+/// stored manifest digest; every object is re-verified on its own handle instead.
+#[derive(Clone, Copy)]
+struct ReviewedNode {
+    length: u64,
+    allocated: u64,
+    modified: i64,
+    is_dir: bool,
+    is_reparse: bool,
+}
+impl ReviewedNode {
+    fn of(tree: &Snapshot, id: u32) -> Self {
+        let node = &tree.nodes[id as usize];
+        Self {
+            length: node.logical,
+            allocated: node.allocated,
+            modified: node.oldest_modified_ms,
+            is_dir: node.is_dir(),
+            is_reparse: node.flags & REPARSE != 0,
+        }
+    }
 }
 #[derive(Debug)]
 pub struct Prepared {
@@ -155,62 +176,147 @@ pub fn selected_git_risk(prepared: &Prepared, selection: &[TreeSelection]) -> bo
 fn emit(sender: &Sender<Event>, event: Event) {
     let _ = sender.send(event);
 }
-fn manifest_digest(tree: &Snapshot, identities: &[Identity]) -> Result<[u8; 32]> {
-    ensure!(
-        tree.nodes.len() == identities.len(),
-        "manifest identity count mismatch"
-    );
-    let mut digest = blake3::Hasher::new();
-    let mut stack = vec![0u32];
-    while let Some(id) = stack.pop() {
-        let n = &tree.nodes[id as usize];
-        let m = identities[id as usize];
-        let name = tree.name_units(id);
-        digest.update(&(name.len() as u64).to_le_bytes());
-        for c in name {
-            digest.update(&c.to_le_bytes());
-        }
-        digest.update(&m.volume.to_le_bytes());
-        digest.update(&m.id);
-        digest.update(&m.length.to_le_bytes());
-        digest.update(&m.modified.to_le_bytes());
-        digest.update(&m.attributes.to_le_bytes());
-        let mut children: Vec<_> = tree.children(id).collect();
-        children.sort_by(|&a, &b| tree.name_units(b).cmp(tree.name_units(a)));
-        digest.update(&(children.len() as u64).to_le_bytes());
-        stack.extend(children);
-        let _ = n;
+/// Wrap the indexed subtree. A live directory walk must be complete before the
+/// human review depends on it; a raw or saved index is accepted with a warning,
+/// because deletion verifies every object on its own handle anyway.
+fn reviewed_target(
+    target: &Target,
+    tree: Snapshot,
+    sender: &Sender<Event>,
+    require_complete: bool,
+) -> Result<PreparedTarget> {
+    if require_complete {
+        ensure!(
+            tree.stats.complete,
+            "cannot prepare an incomplete subtree: {} read errors; {}",
+            tree.stats.errors,
+            tree.stats.warnings.join("; ")
+        );
+    } else if !tree.stats.complete {
+        emit(
+            sender,
+            Event::Preparing(format!(
+                "{}: index reported {} problem(s); missing entries stay untouched",
+                platform::display_path(&target.path),
+                tree.stats.errors
+            )),
+        );
     }
-    Ok(*digest.finalize().as_bytes())
+    Ok(PreparedTarget {
+        target: target.clone(),
+        tree,
+    })
 }
-fn capture(target: &Target, threads: usize) -> Result<PreparedTarget> {
-    let (tree, identities) = scan::fs::capture(
+/// Cut one staged target out of an index the caller supplied (scan --save).
+fn indexed_target(target: &Target, index: &Snapshot) -> Result<PreparedTarget> {
+    let tree = index.subtree(&target.path)?;
+    Ok(PreparedTarget {
+        target: target.clone(),
+        tree,
+    })
+}
+/// Fast path: one raw volume index per volume, then the marked subtree is cut out
+/// of it. Needs administrator rights; any failure or incomplete index returns
+/// Ok(None) so the caller can fall back to the directory walk.
+fn raw_subtree(
+    target: &Target,
+    threads: usize,
+    sender: &Sender<Event>,
+    cache: &mut BTreeMap<String, Option<Arc<Snapshot>>>,
+) -> Result<Option<Snapshot>> {
+    if !platform::elevation::is_elevated() {
+        return Ok(None);
+    }
+    let volume = platform::volume_info(&target.path)?;
+    let slot = cache
+        .entry(platform::path_key(&volume.root))
+        .or_insert_with(|| {
+            emit(
+                sender,
+                Event::Preparing(format!(
+                    "Raw volume index (fast backend): {}",
+                    volume.root.display()
+                )),
+            );
+            let started = std::time::Instant::now();
+            match scan::volume_snapshot(&volume, threads, 8, RAW_INDEX_BUDGET) {
+                Ok(full) => {
+                    emit(
+                        sender,
+                        Event::Preparing(format!(
+                            "Raw volume index ready in {} ms: {} entries{}",
+                            started.elapsed().as_millis(),
+                            full.nodes.len(),
+                            if full.stats.complete {
+                                String::new()
+                            } else {
+                                format!(" ({} problem(s))", full.stats.errors)
+                            }
+                        )),
+                    );
+                    Some(Arc::new(full))
+                }
+                Err(e) => {
+                    emit(
+                        sender,
+                        Event::Preparing(format!(
+                            "Raw volume index unavailable ({e:#}); using a directory walk"
+                        )),
+                    );
+                    None
+                }
+            }
+        });
+    let Some(index) = slot.as_ref() else {
+        return Ok(None);
+    };
+    match index.subtree(&target.path) {
+        Ok(tree) => Ok(Some(tree)),
+        Err(e) => {
+            emit(
+                sender,
+                Event::Preparing(format!(
+                    "{}: {e:#}; using a directory walk",
+                    platform::display_path(&target.path)
+                )),
+            );
+            Ok(None)
+        }
+    }
+}
+/// Directory walk used when the raw index is unavailable: directory-listing
+/// metadata only, no per-file handle and no hash.
+fn capture_light(
+    target: &Target,
+    threads: usize,
+    sender: &Sender<Event>,
+) -> Result<PreparedTarget> {
+    ensure!(
+        platform::identity(&target.path)?.same_file(&target.identity),
+        "target was replaced since it was staged"
+    );
+    let progress = |count: u64| {
+        emit(
+            sender,
+            Event::Preparing(format!(
+                "Indexing {}: {count} items so far",
+                platform::display_path(&target.path)
+            )),
+        );
+    };
+    let tree = scan::fs::scan_light(
         &target.path,
         platform::volume_info(&target.path)?,
         threads,
         768 * 1024 * 1024,
-        true,
+        Some(&progress),
     )?;
-    ensure!(
-        tree.stats.complete,
-        "cannot prepare an incomplete subtree: {} read errors; {}",
-        tree.stats.errors,
-        tree.stats.warnings.join("; ")
-    );
-    ensure!(
-        identities[0].same_file(&target.identity),
-        "target was replaced since it was staged"
-    );
-    let digest = manifest_digest(&tree, &identities)?;
-    Ok(PreparedTarget {
-        target: target.clone(),
-        tree,
-        identities,
-        digest,
-    })
+    reviewed_target(target, tree, sender, true)
 }
+const RAW_INDEX_BUDGET: u64 = 1024 * 1024 * 1024;
 pub fn prepare(
     plan_path: &Path,
+    snapshot: Option<&Path>,
     fetch: bool,
     threads: usize,
     sender: &Sender<Event>,
@@ -231,11 +337,27 @@ pub fn prepare(
     };
     let mut repos = BTreeSet::new();
     let mut volumes = BTreeMap::new();
+    // One index per source: a caller-supplied snapshot, or one raw volume index per
+    // volume. Both are kept only while their targets are prepared.
+    let saved = snapshot
+        .map(|path| {
+            emit(
+                sender,
+                Event::Preparing(format!(
+                    "Reading saved index: {}",
+                    platform::display_path(path)
+                )),
+            );
+            Snapshot::load(path).map(Arc::new)
+        })
+        .transpose()
+        .context("load the requested scan index")?;
+    let mut raw: BTreeMap<String, Option<Arc<Snapshot>>> = BTreeMap::new();
     for target in &p.plan.targets {
         emit(
             sender,
             Event::Preparing(format!(
-                "Reading reviewed manifest: {}",
+                "Indexing reviewed subtree (fast walk, no hashes): {}",
                 platform::display_path(&target.path)
             )),
         );
@@ -258,7 +380,13 @@ pub fn prepare(
                     );
                 }
             }
-            capture(target, threads)
+            if let Some(index) = saved.as_ref() {
+                return indexed_target(target, index);
+            }
+            if let Some(tree) = raw_subtree(target, threads, sender, &mut raw)? {
+                return reviewed_target(target, tree, sender, false);
+            }
+            capture_light(target, threads, sender)
         })();
         match result {
             Ok(prepared) => {
@@ -305,15 +433,8 @@ pub fn prepare(
             }),
         }
     }
-    // fetch writes Git objects/remote tracking refs. The manifest must be captured AFTER it.
-    if fetch {
-        for item in &mut p.targets {
-            match capture(&item.target, threads) {
-                Ok(fresh) => *item = fresh,
-                Err(e) => p.problems.push(format!("post-fetch snapshot: {e:#}")),
-            }
-        }
-    }
+    // The review index carries no digest and no per-file identity, so a later
+    // fetch cannot invalidate it; every object is re-verified when it is deleted.
     for t in &p.targets {
         p.total_items += t.tree.nodes.len() as u64;
         p.allocated_upper_bound += t.tree.nodes[0].allocated;
@@ -440,7 +561,7 @@ impl Executor<'_> {
     fn open_reviewed(
         &mut self,
         path: &Path,
-        expected: Identity,
+        reviewed: ReviewedNode,
         delete_this: bool,
     ) -> Result<Option<File>> {
         for _ in 0..3 {
@@ -448,16 +569,22 @@ impl Executor<'_> {
                 Ok(file) => {
                     let actual = platform::identity_from_handle(&file)?;
                     ensure!(
-                        actual.same_file(&expected)
-                            && actual.attributes & 0x410 == expected.attributes & 0x410,
-                        "target identity/type changed since review"
+                        actual.is_dir() == reviewed.is_dir
+                            && actual.is_reparse() == reviewed.is_reparse,
+                        "target type changed since review"
                     );
-                    if !actual.is_dir() {
+                    if !reviewed.is_dir {
                         ensure!(
-                            actual.length == expected.length
-                                && actual.modified == expected.modified,
-                            "file changed after review; refresh required"
+                            actual.length == reviewed.length,
+                            "file size changed after review; refresh required"
                         );
+                        if reviewed.modified != UNKNOWN_MTIME {
+                            ensure!(
+                                platform::modified_unix_ms(actual.modified)
+                                    == Some(reviewed.modified),
+                                "file modification time changed after review; refresh required"
+                            );
+                        }
                     }
                     return Ok(Some(file));
                 }
@@ -489,8 +616,8 @@ impl Executor<'_> {
             self.error(&path, "directory nesting exceeds safe deletion depth");
             return false;
         }
-        let expected = target.identities[id as usize];
-        let file = match self.open_reviewed(&path, expected, selection.selected(id)) {
+        let reviewed = ReviewedNode::of(&target.tree, id);
+        let file = match self.open_reviewed(&path, reviewed, selection.selected(id)) {
             Ok(Some(file)) => file,
             Ok(None) => {
                 self.outcome.processed += 1;
@@ -508,7 +635,7 @@ impl Executor<'_> {
         // The opened parent directory stays pinned until all its reviewed children
         // are processed. New children are NEVER enumerated/deleted during execution.
         let mut children_ok = true;
-        if expected.is_dir() && !expected.is_reparse() {
+        if reviewed.is_dir && !reviewed.is_reparse {
             for child in target.tree.children(id) {
                 if !self.delete_node(target, selection, child, depth + 1) {
                     children_ok = false;
@@ -541,11 +668,11 @@ impl Executor<'_> {
         self.outcome.processed += 1;
         if success {
             self.outcome.removed += 1;
-            if !expected.is_dir() {
+            if !reviewed.is_dir {
                 self.outcome.removed_bytes = self
                     .outcome
                     .removed_bytes
-                    .saturating_add(expected.allocated);
+                    .saturating_add(reviewed.allocated);
             }
         }
         self.progress(&path);
@@ -558,7 +685,6 @@ pub(crate) fn execute(
     approval: Approval,
     cancel: Arc<AtomicBool>,
     sender: Sender<Event>,
-    threads: usize,
 ) -> Result<Outcome> {
     ensure!(
         approval.revision == prepared.plan.revision
@@ -571,8 +697,8 @@ pub(crate) fn execute(
         store.plan.revision == approval.revision,
         "plan changed while window was open; refresh and confirm again"
     );
-    // Re-enumerate every reviewed target BEFORE deleting anything. A late-created
-    // file, changed inode, changed content metadata or new Git file cancels the run.
+    // The staged target itself is re-checked before anything is deleted; individual
+    // objects are verified on their own deletion handles while the run progresses.
     for (target, selection) in prepared.targets.iter().zip(&approval.selection) {
         if selection.totals(0).items() == 0 {
             continue;
@@ -594,12 +720,6 @@ pub(crate) fn execute(
         ensure!(
             identity.same_file(&target.target.identity),
             "staged target replaced"
-        );
-        let fresh = capture(&target.target, threads)?;
-        ensure!(
-            fresh.digest == target.digest,
-            "{} changed after review; NOTHING has been deleted; refresh and reconfirm",
-            target.target.path.display()
         );
     }
     let audit_path = prepared.plan_path.with_extension("audit.jsonl");
