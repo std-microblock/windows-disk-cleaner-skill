@@ -19,7 +19,8 @@
 - --no-git 只跳过报告注释，绝不能关闭删除安全检查。
 - --no-save 用于一次性只读扫描；--json 提供有界结构化报告而不是海量文件全量输出。
 - detail 是缓存快照，可能过期；审阅窗口用 --snapshot 复用已有索引时同样可能过期。
-- show-rm 索引顺序：显式 --snapshot → 提权时的一次原始卷索引（NTFS/ReFS，按卷缓存）→ 未提权时的目录遍历（只读目录元数据，不做逐文件打开）。
+- show-rm 索引顺序：显式 --snapshot → 卷原始索引（NTFS/ReFS，按卷缓存，同一窗口内多个目标只读一次）→ 只有显式 --index fs 时才走目录枚举。
+- show-rm 默认自动提权：需要读卷原始元数据时会自己弹一次 UAC（agent 不需要额外加 --elevate，也不要点 UAC 按钮）。用 --snapshot 或 --index fs 则不请求提权。
 - 审阅树不含哈希；实际删除前对每个勾选对象重新打开防替换句柄，核对类型/大小/修改时间，变化过的对象跳过并报告。
 - 时间列同时显示 LATEST UTC (max) 与 OLDEST UTC (min)，文件夹统计后代文件、文件两者相同。v2 缓存可从保存的逐文件时间自动补算 max，不需要重新扫描；v1 缓存缺失时间，需重新扫描。
 - compare LEFT.dcscan RIGHT.dcscan --scope PATH 对照完整子树，而非屏幕截断的行。
@@ -35,18 +36,25 @@ all_content_synced=true 才是本次审计没有发现工作区本地数据、�
 
     disk-cleaner.exe rm -rf D:/Projects/app/target --reason "可重建的编译产物，保留源代码"
     disk-cleaner.exe rm C:/Users/Example/Downloads/archive.zip --reason "用户确认已解压且不再需要"
+    disk-cleaner.exe rm -rf D:/Cache/junk --reason "过期缓存，可重建" --warn "不确定是否仍被本地脚本引用，删前再看一眼"
+    disk-cleaner.exe rm D:/Data/models --reason "用户明确同意删除" --critical "无法核实是否含唯一产物，删除不可恢复"
     disk-cleaner.exe undo-rm D:/Projects/app/target
     disk-cleaner.exe undo-rm --all
     disk-cleaner.exe show-rm --text
     disk-cleaner.exe show-rm --json
     disk-cleaner.exe show-rm
     disk-cleaner.exe show-rm --snapshot .disk-cleaner/D.dcscan
+    disk-cleaner.exe show-rm --index fs
 
+- `--warn TEXT` / `--critical TEXT` 可重复，附加到本次 rm 标记的目标；只做提示和高亮，不阻止删除，也不算用户确认。
+- 不确定能否删除的对象，先问用户再标记（见 SKILL.md 流程 4）；没有明确答复就不要标记，也不要把猜测写进 reason 当结论。
 - -reason 兼容旧例子，推荐 --reason。
 - -f 仅忽略不存在的路径，不跳过任何确认；-r 仅允许标记文件夹。
 - 不支持通配符、ADS 路径、设备路径、卷根、受保护的 OS 路径，或穿越 junction/symlink 的父目录。
 - 默认计划可用全局 --plan PATH 改变。计划有并发锁、schema 和 revision，使用原子替换保存。
 - 没有 --yes、execute、force-delete、隐藏的无头删除入口。
+- show-rm 在文件树里高亮 rm 的 warn/critical 提示：行内“注意 / 严重”标记 + 底色，选中行下方给出完整文字；不弹窗，也不阻止删除。
+- show-rm --text 用 `!!` / `!` 前缀与 `CRITICAL:` / `WARN:` 行标出提示；show-rm --json 在 `targets[].alerts` 中保留原文（`level` 为 warn 或 critical）。
 - show-rm --fetch 可以在审阅准备阶段核实 remote。agent 只负责打开窗口，所有破坏性决定交给用户。
 - 占用处理使用 Restart Manager；关键进程/服务和本程序不会被关闭，无法识别占用者时要求用户手动处理。
 

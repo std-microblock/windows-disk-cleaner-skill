@@ -14,8 +14,9 @@ Rust CLI + 轻量 Slint Fluent 清理审阅窗口 + agent skill。
     .\target\release\disk-cleaner.exe scan D:/Projects --backend fs
     .\target\release\disk-cleaner.exe detail D:/Projects --snapshot .disk-cleaner/last.dcscan
 
-权限：加 --elevate 时 CLI 通过 Windows UAC 重新启动自身（每次一次弹窗，由用户同意），
+权限：scan 加 --elevate 时 CLI 通过 Windows UAC 重新启动自身（每次一次弹窗，由用户同意），
 等待子进程并把它的输出原样回传；不加则保持当前权限，严格后端直接失败而不静默回退 fs。
+show-rm 需要读卷原始索引，因此默认自己弹一次 UAC（--snapshot 或 --index fs 则不弹）。
 不运行 gsudo、不配置常驻提权或凭据缓存。
 
 默认 8 线程、8 MiB MFT 批次、1024 MiB 索引预算。完整 UTF-16 索引保存为带校验的
@@ -24,6 +25,7 @@ Rust CLI + 轻量 Slint Fluent 清理审阅窗口 + agent skill。
 ## 安全清理
 
     .\target\release\disk-cleaner.exe rm -rf D:/Projects/app/target --reason "可重建的编译产物"
+    .\target\release\disk-cleaner.exe rm -rf D:/Cache/junk --reason "过期缓存" --warn "不确定是否仍在使用"
     .\target\release\disk-cleaner.exe show-rm --text
     .\target\release\disk-cleaner.exe undo-rm D:/Projects/app/target
     .\target\release\disk-cleaner.exe show-rm
@@ -35,6 +37,8 @@ Rust CLI + 轻量 Slint Fluent 清理审阅窗口 + agent skill。
 - 每个勾选对象在删除前重新打开防替换句柄（不共享写/删除），核对类型/大小/修改时间；变化过的对象跳过并报告。
 - 标记文件 clean-targets.json 只保存路径、理由、标记时间、对象身份与大小汇总；重解析点不递归跟随。
 - git2 检查工作树、所有本地分支/标签、stash、忽略项和未跟踪项；缓存 remote 不是远端证明。
+- rm 的 `--warn` / `--critical` 给标记附加提示（可重复），审阅窗口在文件树里用“注意 / 严重”标记与底色高亮，选中行下方显示完整文字。提示不弹窗、不阻止删除，也不能当作用户的确认。
+- 拿不准能否删除的对象，agent 必须先问用户再标记；不确定的不要写进标记清单。
 - Git 本地/未知风险由用户二次确认；占用使用 Restart Manager，用户单独决定是否关闭应用。
 - 关键服务/进程不会关闭；强制关闭需额外勾选。实时进度可停止，已删除内容不能恢复。
 - 永久删除不入回收站，audit.jsonl 记录执行结果。agent 不允许操作破坏性确认按钮。
@@ -59,14 +63,26 @@ LATEST UTC (max) 是主要列，OLDEST UTC (min) 同时保留。
 - 原始扫描读整卷元数据，小子目录的 fs 可能更快。速度受缓存/记录数/杀毒/存储影响。
 - 在线卷不是冻结的 VSS 快照；分配空间不等于释放量（硬链接/克隆块/元数据）。
 
+## 格式化与提交
+
+    cargo fmt --all
+    npx --yes prettier@3.8.1 --write README.md THIRD_PARTY_NOTICES.md .prettierrc.json "skill/**/*.md" "skill/**/*.yaml" "scripts/**/*.mjs" ".github/workflows/*.yml"
+
+克隆后执行一次 `git config core.hooksPath .githooks` 启用 pre-commit 钩子：提交前自动跑上面两条命令，
+并把已暂存、格式化前未做部分暂存的文件重新加入索引（不会吞掉你的部分暂存内容）。钩子是 shell 脚本，
+在 Linux/macOS 上如果提示不可执行，先 `chmod +x .githooks/pre-commit`。CI 另外跑 cargo fmt --check、
+clippy -D warnings 和 prettier --check。
+
 ## 打包、发布与安装 skill
 
     node scripts/package-skill.mjs     # dist/windows-disk-cleaner/：skill 源码 + Release 程序 + 许可
     node scripts/archive-skill.mjs     # dist/windows-disk-cleaner-skill.zip + dist/SHA256SUMS.txt
     node scripts/install-skill.mjs     # 安装到本机 skill 目录（默认 ~/.agents/skills，--dest 可改）
 
-审阅可直接复用索引，不必重复扫描：
+审阅默认直接读卷原始索引（NTFS/ReFS，2 个并发读句柄；4.27M 条目的系统盘约 13–18 秒），
+同卷多个目标只读一次；重复审阅用已保存的索引，毫秒级：
 
+    .\target\release\disk-cleaner.exe scan D:/ --backend ntfs --elevate --save .disk-cleaner/D.dcscan
     .\target\release\disk-cleaner.exe show-rm --snapshot .disk-cleaner/D.dcscan
 
 install-skill 只覆盖目标 skill 目录本身，不动其他 skill 或全局配置；目标已存在时需显式 --force。

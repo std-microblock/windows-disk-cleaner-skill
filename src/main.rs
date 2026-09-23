@@ -49,7 +49,7 @@ enum Command {
     UiPreview {
         #[arg(long)]
         out: PathBuf,
-        #[arg(long,default_value="review",value_parser=["review","git","lock","progress"])]
+        #[arg(long,default_value="review",value_parser=["review","git","lock","progress","notes"])]
         state: String,
     },
     /// Scan a volume (fast) or subtree (fs); save the complete, lossless drill-down index.
@@ -96,6 +96,18 @@ enum Command {
         force: bool,
         #[arg(long, default_value = "")]
         reason: String,
+        #[arg(
+            long,
+            value_name = "TEXT",
+            help = "Note shown highlighted during review: something the human must look at again. Repeatable; it never deletes or authorizes anything"
+        )]
+        warn: Vec<String>,
+        #[arg(
+            long,
+            value_name = "TEXT",
+            help = "High-risk note; show-rm lists it first and marks the row in red so nobody skims past it. Repeatable"
+        )]
+        critical: Vec<String>,
         #[arg(long,default_value_t=4,value_parser=clap::value_parser!(u16).range(1..=64))]
         threads: u16,
     },
@@ -119,6 +131,13 @@ enum Command {
             help = "Index the review tree from this scan --save snapshot instead of scanning again"
         )]
         snapshot: Option<PathBuf>,
+        #[arg(
+            long,
+            value_enum,
+            default_value = "volume",
+            help = "volume: raw NTFS/ReFS index (default, needs --elevate); fs: explicit directory walk"
+        )]
+        index: disk_cleaner::deletion::IndexSource,
     },
 }
 #[derive(Args)]
@@ -322,14 +341,18 @@ fn run(cli: Cli) -> Result<i32> {
             recursive,
             force,
             reason,
+            warn,
+            critical,
             threads,
         } => {
+            let alerts = plan::notes(&warn, &critical)?;
             let targets = plan::stage(
                 &cli.plan,
                 &paths,
                 recursive,
                 force,
                 &reason,
+                &alerts,
                 threads as usize,
             )?;
             for t in &targets {
@@ -339,6 +362,9 @@ fn run(cli: Cli) -> Result<i32> {
                     report::human(t.summary.allocated_bytes),
                     report::safe_text(&t.reason)
                 );
+                for a in &t.alerts {
+                    println!("  {}: {}", a.level.label(), report::safe_text(&a.text));
+                }
                 if let Some(g) = &t.git {
                     println!("  {}", g.concise());
                 }
@@ -348,6 +374,12 @@ fn run(cli: Cli) -> Result<i32> {
                 targets.len(),
                 platform::absolute(&cli.plan)?.display()
             );
+            if !alerts.is_empty() {
+                println!(
+                    "{} note(s) attached to this batch; show-rm highlights them in the tree and in --text/--json.",
+                    alerts.len()
+                );
+            }
         }
         Command::UndoRm { paths, all } => {
             let n = plan::undo(&cli.plan, &paths, all)?;
@@ -358,25 +390,46 @@ fn run(cli: Cli) -> Result<i32> {
             json,
             fetch,
             snapshot,
+            index,
         } => {
             if text || json {
                 let store = plan::Store::open(&cli.plan)?;
                 if json {
                     output_json(&store.plan)?;
                 } else {
+                    let counted = |level: plan::Level| {
+                        store
+                            .plan
+                            .targets
+                            .iter()
+                            .filter(|t| t.severity() == Some(level))
+                            .count()
+                    };
+                    let critical = counted(plan::Level::Critical);
+                    let warned = counted(plan::Level::Warn);
                     println!(
-                        "PENDING ONLY | {} | revision={}",
+                        "PENDING ONLY | {} | revision={} | notes: {critical} critical, {warned} warn",
                         store.path.display(),
                         store.plan.revision
                     );
                     for t in &store.plan.targets {
+                        let flag = match t.severity() {
+                            Some(plan::Level::Critical) => "!! ",
+                            Some(plan::Level::Warn) => "!  ",
+                            None => "   ",
+                        };
                         println!(
-                            "{}  {}  files={}  reason={}",
+                            "{flag}{}  {}  files={}  reason={}",
                             report::human(t.summary.allocated_bytes),
                             report::safe_text(&platform::display_path(&t.path)),
                             t.summary.files,
                             report::safe_text(&t.reason)
                         );
+                        for level in plan::Level::WORST_FIRST {
+                            for a in t.alerts.iter().filter(|a| a.level == level) {
+                                println!("    {}: {}", level.label(), report::safe_text(&a.text));
+                            }
+                        }
                         if let Some(g) = &t.git {
                             println!("  {}", g.concise());
                         }
@@ -385,14 +438,32 @@ fn run(cli: Cli) -> Result<i32> {
                         "{} targets. This text view cannot delete anything.",
                         store.plan.targets.len()
                     );
+                    if critical + warned > 0 {
+                        println!(
+                            "Notes are the agent's own words: they prove nothing and never replace the marked reason. Resolve them with the user before deleting."
+                        );
+                    }
                 }
             } else {
                 #[cfg(feature = "gui")]
                 {
+                    // The review window reads the volume's raw metadata, so it asks for
+                    // administrator rights itself (one UAC prompt). A saved snapshot or an
+                    // explicit --index fs walk needs no elevation at all.
+                    #[cfg(windows)]
+                    if snapshot.is_none()
+                        && index == disk_cleaner::deletion::IndexSource::Volume
+                        && !platform::elevation::is_elevated()
+                    {
+                        println!(
+                            "Opening human review with administrator rights: one UAC prompt is needed to read the volume index."
+                        );
+                        return platform::elevation::relaunch_elevated();
+                    }
                     println!(
                         "Opening human review. The agent must NOT click deletion/close-process confirmations."
                     );
-                    disk_cleaner::gui::run(&cli.plan, snapshot.as_deref(), fetch)?;
+                    disk_cleaner::gui::run(&cli.plan, snapshot.as_deref(), index, fetch)?;
                 }
                 #[cfg(not(feature = "gui"))]
                 bail!(

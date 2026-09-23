@@ -30,6 +30,7 @@ struct State {
     cancel: Arc<AtomicBool>,
     path: PathBuf,
     snapshot: Option<PathBuf>,
+    source: crate::deletion::IndexSource,
     sender: Sender<Event>,
     threads: usize,
 }
@@ -48,6 +49,43 @@ fn target_git_risk(p: &Prepared, target: usize) -> bool {
             && (platform::within(&g.root, &p.targets[target].target.path)
                 || platform::within(&p.targets[target].target.path, &g.root))
     })
+}
+/// 0 = no note, 1 = warn, 2 = critical. Notes live on the staged target, so they
+/// also mark every ancestor group row and cannot hide in a collapsed subtree.
+fn severity_of(target: &plan::Target) -> i32 {
+    match target.severity() {
+        Some(plan::Level::Critical) => 2,
+        Some(plan::Level::Warn) => 1,
+        None => 0,
+    }
+}
+/// Row text for the worst notes of one target; hidden lower notes are counted.
+fn alert_text(target: &plan::Target) -> String {
+    let severity = severity_of(target);
+    if severity == 0 {
+        return String::new();
+    }
+    let level = if severity == 2 {
+        plan::Level::Critical
+    } else {
+        plan::Level::Warn
+    };
+    let mut texts: Vec<String> = target
+        .alerts
+        .iter()
+        .filter(|a| a.level == level)
+        .map(|a| report::safe_text(&a.text))
+        .collect();
+    let hidden = target.alerts.len() - texts.len();
+    let mut row = if texts.is_empty() {
+        String::new()
+    } else {
+        texts.remove(0)
+    };
+    if hidden > 0 {
+        row.push_str(&format!(" (+{hidden})"));
+    }
+    row
 }
 fn file_icon(name: &str, directory: bool, reparse: bool) -> &'static str {
     if reparse {
@@ -94,7 +132,8 @@ fn make_rows(
             };
             let (selected, total) = self.forest.tally(&self.trees, self.choices, key);
             let open = self.expanded.contains_key(&key);
-            let (name, reason, directory, expandable, icon, warning, git) = match location {
+            let (name, reason, directory, expandable, icon, warning, git, severity) = match location
+            {
                 Location::Group(group) => {
                     let g = &self.forest.groups[group];
                     (
@@ -109,6 +148,11 @@ fn make_rows(
                         if g.drive { "drive" } else { "folder" },
                         g.targets.iter().any(|&t| target_git_risk(self.p, t)),
                         false,
+                        g.targets
+                            .iter()
+                            .map(|&t| severity_of(&self.p.targets[t].target))
+                            .max()
+                            .unwrap_or(0),
                     )
                 }
                 Location::Entry { target, node } => {
@@ -140,8 +184,13 @@ fn make_rows(
                         icon,
                         node == 0 && target_git_risk(self.p, target),
                         node == 0 && target_has_git(self.p, target),
+                        if node == 0 { severity_of(&t.target) } else { 0 },
                     )
                 }
+            };
+            let alert = match location {
+                Location::Entry { target, node: 0 } => alert_text(&self.p.targets[target].target),
+                _ => String::new(),
             };
             self.rows.push(TreeRow {
                 key,
@@ -158,6 +207,8 @@ fn make_rows(
                 warning,
                 git,
                 icon: icon.into(),
+                severity,
+                alert: alert.into(),
             });
             if open {
                 let children = self.forest.children(&self.trees, key);
@@ -203,6 +254,8 @@ fn make_rows(
                 warning: false,
                 git: false,
                 icon: "add".into(),
+                severity: 0,
+                alert: "".into(),
             }),
         }
     }
@@ -272,17 +325,34 @@ fn show_selection(ui: &ReviewWindow, s: &State) {
     ui.set_selected_key(key);
     ui.set_selected_path(platform::display_path(&path).into());
     let (selected, total) = s.forest.tally(&trees, &s.choices, key);
-    let explanation = match s.forest.locate(key).unwrap() {
-        Location::Group(_) => "分组节点本身不会删除；勾选仅影响其下已标记内容。".to_owned(),
-        Location::Entry { target, .. } => format!(
-            "原因：{}",
-            if p.targets[target].target.reason.is_empty() {
-                "未填写"
-            } else {
-                &p.targets[target].target.reason
-            }
+    let (explanation, alerts, severity) = match s.forest.locate(key).unwrap() {
+        Location::Group(_) => (
+            "分组节点本身不会删除；勾选仅影响其下已标记内容。".to_owned(),
+            String::new(),
+            0,
         ),
+        Location::Entry { target, .. } => {
+            let t = &p.targets[target].target;
+            (
+                format!(
+                    "原因：{}",
+                    if t.reason.is_empty() {
+                        "未填写"
+                    } else {
+                        &t.reason
+                    }
+                ),
+                t.alerts
+                    .iter()
+                    .map(|a| format!("[{}] {}", a.level.label(), report::safe_text(&a.text)))
+                    .collect::<Vec<_>>()
+                    .join("    "),
+                severity_of(t),
+            )
+        }
     };
+    ui.set_selected_severity(severity);
+    ui.set_selected_alerts(alerts.into());
     ui.set_selected_reason(
         format!(
             "{explanation}  已选 {} / {} 文件、{} / {} 文件夹 · {}",
@@ -336,11 +406,12 @@ fn refresh(ui: &ReviewWindow, state: &Rc<RefCell<State>>, fetch: bool) {
     s.selected = None;
     let path = s.path.clone();
     let snapshot = s.snapshot.clone();
+    let source = s.source;
     let sender = s.sender.clone();
     let threads = s.threads;
     let cancel = s.cancel.clone();
     std::thread::spawn(move || {
-        match deletion::prepare(&path, snapshot.as_deref(), fetch, threads, &sender) {
+        match deletion::prepare(&path, snapshot.as_deref(), source, fetch, threads, &sender) {
             Ok(p) => {
                 if cancel.load(Ordering::Relaxed) {
                     let _ = sender.send(Event::Fatal("准备已停止，没有删除文件。".into()));
@@ -391,7 +462,12 @@ fn begin_delete(ui: &ReviewWindow, state: &Rc<RefCell<State>>, git_ack: bool) {
         },
     );
 }
-pub fn run(path: &Path, snapshot: Option<&Path>, fetch: bool) -> Result<()> {
+pub fn run(
+    path: &Path,
+    snapshot: Option<&Path>,
+    source: deletion::IndexSource,
+    fetch: bool,
+) -> Result<()> {
     let index = snapshot.map(Path::to_path_buf);
     let ui = ReviewWindow::new()?;
     let (tx, rx) = mpsc::channel();
@@ -407,6 +483,7 @@ pub fn run(path: &Path, snapshot: Option<&Path>, fetch: bool) -> Result<()> {
         cancel: Arc::new(AtomicBool::new(false)),
         path,
         snapshot: index,
+        source,
         sender: tx,
         threads: 8,
     }));
@@ -493,7 +570,36 @@ pub fn run(path: &Path, snapshot: Option<&Path>, fetch: bool) -> Result<()> {
     {
         let weak = ui.as_weak();
         let state = state.clone();
-        ui.on_request_delete(move||{let Some(ui)=weak.upgrade()else{return;};if ui.get_busy()||!ui.get_reviewed(){return;}let p=state.borrow().prepared.clone();if let Some(p)=p{if deletion::selected_git_risk(&p,&state.borrow().choices){let mut body=String::from("以下仓库存在未同步、本地独有或无法核实的数据。忽略项也可能包含重要文件；它们不会因为被 gitignore 就变得安全。\n\n");for g in deletion::selected_git(&p,&state.borrow().choices){if g.needs_confirmation(){body+=&format!("{}\n{}\n{}\n\n",platform::display_path(&g.root),g.concise(),g.risks.join("\n"));}}body+="继续后，这些标记路径中的本地内容将被永久删除。";ui.set_modal_title("Git 数据需要第二次确认".into());ui.set_modal_body(body.into());ui.set_modal_kind("git".into());}else{begin_delete(&ui,&state,false);}}});
+        ui.on_request_delete(move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_busy() || !ui.get_reviewed() {
+                return;
+            }
+            let Some(p) = state.borrow().prepared.clone() else {
+                return;
+            };
+            if deletion::selected_git_risk(&p, &state.borrow().choices) {
+                let mut body = String::from("以下仓库存在未同步、本地独有或无法核实的数据。忽略项也可能包含重要文件；它们不会因为被 gitignore 就变得安全。\n\n");
+                for g in deletion::selected_git(&p, &state.borrow().choices) {
+                    if g.needs_confirmation() {
+                        body += &format!(
+                            "{}\n{}\n{}\n\n",
+                            platform::display_path(&g.root),
+                            g.concise(),
+                            g.risks.join("\n")
+                        );
+                    }
+                }
+                body += "继续后，这些标记路径中的本地内容将被永久删除。";
+                ui.set_modal_title("Git 数据需要第二次确认".into());
+                ui.set_modal_body(body.into());
+                ui.set_modal_kind("git".into());
+            } else {
+                begin_delete(&ui, &state, false);
+            }
+        });
     }
     {
         let weak = ui.as_weak();
@@ -645,7 +751,7 @@ fn example_prepared() -> Prepared {
         deletion::PreparedTarget,
         git_audit::GitAudit,
         model::{DIR, Snapshot},
-        plan::{Plan, Summary, Target},
+        plan::{Alert, Level, Plan, Summary, Target},
         platform::{Identity, VolumeInfo},
     };
     let gib = 1024 * 1024 * 1024u64;
@@ -753,13 +859,27 @@ fn example_prepared() -> Prepared {
     download.nodes[0].allocated = 4 * gib;
     download.finish().unwrap();
     let items = [
-        (build, "可重建的 Rust 编译产物"),
-        (cache, "过期的构建缓存"),
-        (download, "已解压，确认不再需要"),
+        (
+            build,
+            "可重建的 Rust 编译产物",
+            vec![Alert {
+                level: Level::Warn,
+                text: "示例：不确定是否仍用于本地调试；用户已确认可重建".into(),
+            }],
+        ),
+        (
+            cache,
+            "过期的构建缓存",
+            vec![Alert {
+                level: Level::Critical,
+                text: "示例：无法核实其中是否含唯一产物，删除前请再确认一次".into(),
+            }],
+        ),
+        (download, "已解压，确认不再需要", Vec::new()),
     ];
     let mut targets = Vec::new();
     let mut plan = Plan::default();
-    for (tree, reason) in items {
+    for (tree, reason, alerts) in items {
         let target = Target {
             id: uuid::Uuid::new_v4(),
             path: tree.root.clone(),
@@ -768,6 +888,7 @@ fn example_prepared() -> Prepared {
             identity: Identity::default(),
             summary: Summary::from_snapshot(&tree),
             git: None,
+            alerts,
         };
         plan.targets.push(target.clone());
         targets.push(PreparedTarget { target, tree });
@@ -825,7 +946,7 @@ pub fn preview(output: &Path, state_name: &str) -> Result<()> {
         .position(|g| g.path == Path::new(r"D:\"))
         .and_then(|i| forest.group_key(i).ok());
     let state = State {
-        prepared: Some(p),
+        prepared: Some(p.clone()),
         choices,
         forest,
         expanded,
@@ -833,6 +954,7 @@ pub fn preview(output: &Path, state_name: &str) -> Result<()> {
         lock_response: None,
         cancel: Arc::new(AtomicBool::new(false)),
         snapshot: None,
+        source: crate::deletion::IndexSource::Volume,
         path: PathBuf::new(),
         sender: tx,
         threads: 1,

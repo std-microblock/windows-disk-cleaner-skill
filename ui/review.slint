@@ -1,6 +1,6 @@
 import { Button, CheckBox, ListView, ScrollView, ProgressIndicator, LineEdit, Palette, AboutSlint } from "std-widgets.slint";
 
-export struct TreeRow { key: int, depth: int, name: string, size: string, files: string, check-state: int, reason: string, directory: bool, expandable: bool, expanded: bool, more: bool, warning: bool, git: bool, icon: string }
+export struct TreeRow { key: int, depth: int, name: string, size: string, files: string, check-state: int, reason: string, directory: bool, expandable: bool, expanded: bool, more: bool, warning: bool, git: bool, icon: string, severity: int, alert: string }
 export struct SpaceRow { drive: string, before: string, after: string, before-ratio: float, after-ratio: float }
 
 
@@ -79,6 +79,9 @@ export component ReviewWindow inherits Window {
     in property <int> selected-key: -1;
     in property <string> selected-path: "选择项目查看完整路径";
     in property <string> selected-reason;
+    in property <string> selected-alerts;
+    // 0 = no note, 1 = warn, 2 = critical
+    in property <int> selected-severity: 0;
     in property <bool> can-unmark: false;
     in-out property <string> modal-kind: "";
     in property <string> modal-title;
@@ -119,14 +122,14 @@ export component ReviewWindow inherits Window {
                         Text { text: "名称"; color: Palette.foreground.with-alpha(0.65); vertical-alignment: center; }
                         Text { text: "待删大小"; width: 100px; color: Palette.foreground.with-alpha(0.65); horizontal-alignment: right; vertical-alignment: center; }
                         Text { text: "文件（已选 / 总数）"; width: 122px; color: Palette.foreground.with-alpha(0.65); horizontal-alignment: right; vertical-alignment: center; }
-                        Text { text: "原因 / 状态"; width: 160px; color: Palette.foreground.with-alpha(0.65); vertical-alignment: center; }
+                        Text { text: "原因 / 状态"; width: 200px; color: Palette.foreground.with-alpha(0.65); vertical-alignment: center; }
                     }
                 }
                 tree := ListView { for item in root.rows : Rectangle { height: 34px; width: tree.visible-width;
-                    background: root.selected-key == item.key && !item.more ? Palette.foreground.with-alpha(0.055) : row-touch.has-hover ? Palette.foreground.with-alpha(0.035) : transparent;
+                    background: root.selected-key == item.key && !item.more ? Palette.foreground.with-alpha(0.055) : row-touch.has-hover ? Palette.foreground.with-alpha(0.035) : item.severity == 2 ? #c42b1c1f : item.severity == 1 ? #9a5b0017 : transparent;
                     border-radius: 4px;
                     accessible-role: list-item;
-                    accessible-label: item.name + ", " + item.size + ", " + item.reason;
+                    accessible-label: item.name + ", " + item.size + ", " + (item.alert != "" ? item.alert : item.reason);
                     accessible-item-selectable: true;
                     accessible-item-selected: root.selected-key == item.key && !item.more;
                     accessible-action-default => { if item.more { root.toggle-row(item.key, true); } else { root.select-row(item.key); } }
@@ -146,10 +149,11 @@ export component ReviewWindow inherits Window {
                         }
                         Text { text: item.size; width: 100px; horizontal-alignment: right; vertical-alignment: center; color: Palette.foreground.with-alpha(0.8); }
                         Text { text: item.files; width: 122px; horizontal-alignment: right; vertical-alignment: center; color: Palette.foreground.with-alpha(0.7); }
-                        HorizontalLayout { width: 160px; spacing: 5px;
+                        HorizontalLayout { width: 200px; spacing: 5px;
+                            if item.severity > 0 : Rectangle { width: 36px; height: 18px; border-radius: 9px; y: (parent.height - self.height) / 2; background: item.severity == 2 ? #c42b1c : #9a5b00; Text { text: item.severity == 2 ? "严重" : "注意"; color: #ffffff; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; } }
                             if item.git : Image { width: 14px; height: 14px; y: (parent.height - self.height) / 2; source: @image-url("icons/fluent/git.svg"); colorize: Palette.foreground.with-alpha(0.65); }
                             if item.warning : Image { width: 14px; height: 14px; y: (parent.height - self.height) / 2; source: @image-url("icons/fluent/warning.svg"); colorize: #a55f13; }
-                            Text { text: item.reason; color: Palette.foreground.with-alpha(item.warning ? 0.85 : 0.6); overflow: elide; vertical-alignment: center; }
+                            Text { text: item.alert != "" ? item.alert : item.reason; font-weight: item.severity == 2 ? 600 : 400; color: Palette.foreground.with-alpha(item.severity > 0 ? 0.9 : item.warning ? 0.85 : 0.6); overflow: elide; vertical-alignment: center; }
                         }
                     }
                 } }
@@ -159,6 +163,7 @@ export component ReviewWindow inherits Window {
         VerticalLayout { spacing: 5px; vertical-stretch: 0;
             LineEdit { text: root.selected-path; read-only: true; }
             Text { text: root.selected-reason; font-size: 11px; color: Palette.foreground.with-alpha(0.6); overflow: elide; }
+            if root.selected-alerts != "" : Text { text: root.selected-alerts; font-size: 11px; font-weight: root.selected-severity == 2 ? 600 : 400; color: root.selected-severity == 2 ? #c42b1c : #8a5a00; overflow: elide; }
         }
         VerticalLayout { spacing: 4px; vertical-stretch: 0;
             for space in root.spaces : HorizontalLayout { height: 19px; spacing: 12px;

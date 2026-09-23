@@ -1,14 +1,22 @@
 //! Streaming NTFS MFT scanner, derived from the technique in Kudaes/MFTool
 //! (Apache-2.0, commit 4441426e8c91a7acfe517ee42eb8130ad4a80cfc).
-//! Rewritten here: bounds-checked parsing, bounded batches, Rayon, full FRNs,
-//! attribute-list extensions and hardlinks; no encrypted/full-MFT/content cache.
+//! Rewritten here: bounds-checked parsing, parallel bounded chunk reads over one
+//! raw handle per worker, full FRNs, attribute-list extensions and hardlinks; no
+//! encrypted/full-MFT/content cache.
 use crate::{
     model::{DIR, ESTIMATED, HARDLINK, INCOMPLETE, REPARSE, Snapshot, UNKNOWN_MTIME, VIRTUAL},
     platform::{RawReader, VolumeInfo},
 };
 use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, bail, ensure};
-use rayon::prelude::*;
+use std::{
+    collections::VecDeque,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+};
 const MASK: u64 = 0x0000ffffffffffff;
 fn u16at(b: &[u8], o: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(
@@ -477,58 +485,95 @@ pub fn scan_raw(
     let mut parents: Vec<(u32, u64)> = Vec::new();
     let mut dirs = AHashMap::new();
     let mut complex: AHashMap<u64, Record> = AHashMap::new();
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()?;
-    let mut buffer =
-        vec![0u8; (buffer_mib.clamp(1, 64) * 1024 * 1024 / g.record).max(1) * g.record];
-    let mut offset = 0;
-    while offset < length {
-        let n = buffer.len().min((length - offset) as usize);
-        read_stream(raw, &extents, g.cluster, offset, &mut buffer[..n])?;
-        let parsed: Vec<_> = pool.install(|| {
-            buffer[..n]
-                .par_chunks_mut(g.record)
-                .enumerate()
-                .map(|(i, bytes)| {
-                    parse_record(bytes, offset / g.record as u64 + i as u64, g.sector)
-                })
-                .collect()
-        });
-        for item in parsed {
-            match item {
-                Ok(Some(record)) => {
-                    if record.base != 0 || record.complex {
-                        let key = if record.base != 0 {
-                            record.base
-                        } else {
-                            record.frn
-                        };
-                        if let Some(existing) = complex.get_mut(&key) {
-                            merge(existing, record)?;
-                        } else {
-                            complex.insert(key, record);
-                        }
-                    } else {
-                        add_record(record, &mut s, &mut parents, &mut dirs)?;
+    // Two concurrent handles measured fastest for this one metadata stream: more
+    // readers interleave the same sequential stream and cut device throughput
+    // (8 readers halved it on test hardware), so extra threads do not help here.
+    let workers = threads.clamp(1, 64).min(2);
+    // The metadata stream is read in independent chunks, each with its own raw
+    // handle: a single serialized handle leaves the device queue depth at one and
+    // costs most of the wall time on multi-million-file volumes.
+    let chunk = (buffer_mib.clamp(1, 64) * 1024 * 1024 / g.record).max(1) * g.record;
+    let chunks = length.div_ceil(chunk as u64);
+    let readers = (0..workers)
+        .map(|_| RawReader::volume(volume))
+        .collect::<Result<Vec<_>>>()?;
+    let queue = Mutex::new(VecDeque::from_iter(0..chunks));
+    let (tx, rx) = mpsc::sync_channel::<Result<(Vec<Result<Option<Record>>>, usize)>>(workers);
+    let cancelled = AtomicBool::new(false);
+    let read = std::thread::scope(|scope| -> Result<()> {
+        for reader in readers {
+            let tx = tx.clone();
+            let queue = &queue;
+            let extents = &extents;
+            let cancelled = &cancelled;
+            scope.spawn(move || {
+                let mut buffer = vec![0u8; chunk];
+                while !cancelled.load(Ordering::Relaxed) {
+                    let Some(index) = queue.lock().unwrap().pop_front() else {
+                        break;
+                    };
+                    let offset = index * chunk as u64;
+                    let n = (length - offset).min(chunk as u64) as usize;
+                    if let Err(e) =
+                        read_stream(&reader, extents, g.cluster, offset, &mut buffer[..n])
+                    {
+                        cancelled.store(true, Ordering::Relaxed);
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                    let parsed = buffer[..n]
+                        .chunks_mut(g.record)
+                        .enumerate()
+                        .map(|(i, bytes)| {
+                            parse_record(bytes, offset / g.record as u64 + i as u64, g.sector)
+                        })
+                        .collect();
+                    if tx.send(Ok((parsed, n / g.record))).is_err() {
+                        break;
                     }
                 }
-                Ok(None) => {}
-                Err(e) => s.warn(e.to_string()),
-            }
+            });
         }
-        offset += n as u64;
-        s.stats.records_read += n as u64 / g.record as u64;
-        let used = s.index_bytes()
-            + parents.capacity() as u64 * 16
-            + dirs.capacity() as u64 * 24
-            + buffer.len() as u64;
-        ensure!(
-            used <= memory_limit,
-            "MFT index memory budget exceeded ({} MiB); use --max-memory-mib or --backend fs on a subtree",
-            used / 1024 / 1024
-        );
-    }
+        drop(tx);
+        while let Ok(message) = rx.recv() {
+            let (parsed, records) = message?;
+            for item in parsed {
+                match item {
+                    Ok(Some(record)) => {
+                        if record.base != 0 || record.complex {
+                            let key = if record.base != 0 {
+                                record.base
+                            } else {
+                                record.frn
+                            };
+                            if let Some(existing) = complex.get_mut(&key) {
+                                merge(existing, record)?;
+                            } else {
+                                complex.insert(key, record);
+                            }
+                        } else {
+                            add_record(record, &mut s, &mut parents, &mut dirs)?;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => s.warn(e.to_string()),
+                }
+            }
+            s.stats.records_read += records as u64;
+            let used = s.index_bytes()
+                + parents.capacity() as u64 * 16
+                + dirs.capacity() as u64 * 24
+                + complex.capacity() as u64 * 64
+                + (chunk * workers) as u64;
+            ensure!(
+                used <= memory_limit,
+                "MFT index memory budget exceeded ({} MiB); use --max-memory-mib or --backend fs on a subtree",
+                used / 1024 / 1024
+            );
+        }
+        Ok(())
+    });
+    read?;
     for (key, mut record) in complex {
         record.frn = key;
         record.base = 0;

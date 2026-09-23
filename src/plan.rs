@@ -32,6 +32,72 @@ impl Summary {
         }
     }
 }
+/// Severity of an agent-authored note. Notes only draw the human's attention to
+/// something rm could not settle; they never authorize and never block deletion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Level {
+    Warn,
+    Critical,
+}
+impl Level {
+    pub fn label(self) -> &'static str {
+        match self {
+            Level::Warn => "WARN",
+            Level::Critical => "CRITICAL",
+        }
+    }
+    pub fn flag(self) -> &'static str {
+        match self {
+            Level::Warn => "--warn",
+            Level::Critical => "--critical",
+        }
+    }
+    /// Worst first: the review window and the text view both list CRITICAL notes first.
+    pub const WORST_FIRST: [Level; 2] = [Level::Critical, Level::Warn];
+}
+/// One note written by rm --warn/--critical. Text is stored verbatim and escaped
+/// with report::safe_text for display, exactly like reasons and scanned names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Alert {
+    pub level: Level,
+    pub text: String,
+}
+pub const MAX_ALERTS: usize = 16;
+pub const MAX_ALERT_CHARS: usize = 300;
+/// Build the note list for one rm invocation. Empty or oversized text is rejected
+/// here rather than in the review window, so a typo cannot silently vanish.
+pub fn notes(warn: &[String], critical: &[String]) -> Result<Vec<Alert>> {
+    let mut alerts: Vec<Alert> = Vec::new();
+    for (level, texts) in [(Level::Warn, warn), (Level::Critical, critical)] {
+        for text in texts {
+            let text = text.trim();
+            ensure!(
+                !text.is_empty(),
+                "{} needs text describing what the human must check",
+                level.flag()
+            );
+            ensure!(
+                text.chars().count() <= MAX_ALERT_CHARS,
+                "{} text is limited to {} characters",
+                level.flag(),
+                MAX_ALERT_CHARS
+            );
+            let alert = Alert {
+                level,
+                text: text.to_owned(),
+            };
+            if !alerts.contains(&alert) {
+                alerts.push(alert);
+            }
+        }
+    }
+    ensure!(
+        alerts.len() <= MAX_ALERTS,
+        "too many notes; at most {MAX_ALERTS} per rm invocation"
+    );
+    Ok(alerts)
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Target {
     pub id: uuid::Uuid,
@@ -41,6 +107,15 @@ pub struct Target {
     pub identity: Identity,
     pub summary: Summary,
     pub git: Option<GitAudit>,
+    /// Attention notes written by rm --warn/--critical. Absent in older plans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alerts: Vec<Alert>,
+}
+impl Target {
+    /// Worst note severity, or None when rm recorded no note for this target.
+    pub fn severity(&self) -> Option<Level> {
+        self.alerts.iter().map(|a| a.level).max()
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plan {
@@ -106,6 +181,20 @@ impl Store {
                 .context("read plan JSON (not executable instructions)")?;
             ensure!(p.schema_version == 1, "unsupported plan schema");
             ensure!(p.targets.len() <= 10000, "too many targets");
+            // Notes are advisory, but a hand-edited plan must not smuggle megabytes
+            // of text into the review window or the console.
+            for t in &p.targets {
+                ensure!(
+                    t.alerts.len() <= MAX_ALERTS,
+                    "too many notes on a staged target"
+                );
+                for a in &t.alerts {
+                    ensure!(
+                        !a.text.trim().is_empty() && a.text.chars().count() <= MAX_ALERT_CHARS,
+                        "invalid note text in plan"
+                    );
+                }
+            }
             p
         } else {
             Plan::default()
@@ -307,6 +396,7 @@ pub fn stage(
     recursive: bool,
     force: bool,
     reason: &str,
+    alerts: &[Alert],
     threads: usize,
 ) -> Result<Vec<Target>> {
     ensure!(
@@ -366,6 +456,7 @@ pub fn stage(
             identity,
             summary,
             git,
+            alerts: alerts.to_vec(),
         });
     }
     store.plan.targets.extend(additions.clone());

@@ -69,6 +69,13 @@ impl Prepared {
         self.problems.is_empty() && !self.targets.is_empty()
     }
 }
+/// Where the review index comes from. The raw volume index is the default and the
+/// only automatic source; a directory walk happens only when it is asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum IndexSource {
+    Volume,
+    Fs,
+}
 #[derive(Clone, Copy, Debug)]
 pub enum LockDecision {
     Skip,
@@ -196,7 +203,7 @@ fn reviewed_target(
         emit(
             sender,
             Event::Preparing(format!(
-                "{}: index reported {} problem(s); missing entries stay untouched",
+                "{}：索引有 {} 处问题，未索引到的内容不会出现在窗口里，也不会被删除",
                 platform::display_path(&target.path),
                 tree.stats.errors
             )),
@@ -223,10 +230,7 @@ fn raw_subtree(
     threads: usize,
     sender: &Sender<Event>,
     cache: &mut BTreeMap<String, Option<Arc<Snapshot>>>,
-) -> Result<Option<Snapshot>> {
-    if !platform::elevation::is_elevated() {
-        return Ok(None);
-    }
+) -> Result<Snapshot> {
     let volume = platform::volume_info(&target.path)?;
     let slot = cache
         .entry(platform::path_key(&volume.root))
@@ -234,7 +238,7 @@ fn raw_subtree(
             emit(
                 sender,
                 Event::Preparing(format!(
-                    "Raw volume index (fast backend): {}",
+                    "读取卷原始索引（NTFS/ReFS）：{}",
                     volume.root.display()
                 )),
             );
@@ -244,13 +248,13 @@ fn raw_subtree(
                     emit(
                         sender,
                         Event::Preparing(format!(
-                            "Raw volume index ready in {} ms: {} entries{}",
+                            "卷原始索引完成：{} ms / {} 项{}",
                             started.elapsed().as_millis(),
                             full.nodes.len(),
                             if full.stats.complete {
                                 String::new()
                             } else {
-                                format!(" ({} problem(s))", full.stats.errors)
+                                format!("（{} 处问题）", full.stats.errors)
                             }
                         )),
                     );
@@ -260,29 +264,17 @@ fn raw_subtree(
                     emit(
                         sender,
                         Event::Preparing(format!(
-                            "Raw volume index unavailable ({e:#}); using a directory walk"
+                            "卷原始索引不可用（{e:#}）；如确实需要，可显式加 --index fs 走目录枚举"
                         )),
                     );
                     None
                 }
             }
         });
-    let Some(index) = slot.as_ref() else {
-        return Ok(None);
-    };
-    match index.subtree(&target.path) {
-        Ok(tree) => Ok(Some(tree)),
-        Err(e) => {
-            emit(
-                sender,
-                Event::Preparing(format!(
-                    "{}: {e:#}; using a directory walk",
-                    platform::display_path(&target.path)
-                )),
-            );
-            Ok(None)
-        }
-    }
+    let index = slot
+        .as_ref()
+        .with_context(|| format!("no raw index for {}", volume.root.display()))?;
+    index.subtree(&target.path)
 }
 /// Directory walk used when the raw index is unavailable: directory-listing
 /// metadata only, no per-file handle and no hash.
@@ -299,7 +291,7 @@ fn capture_light(
         emit(
             sender,
             Event::Preparing(format!(
-                "Indexing {}: {count} items so far",
+                "目录枚举中：{}（已 {count} 项）",
                 platform::display_path(&target.path)
             )),
         );
@@ -317,6 +309,7 @@ const RAW_INDEX_BUDGET: u64 = 1024 * 1024 * 1024;
 pub fn prepare(
     plan_path: &Path,
     snapshot: Option<&Path>,
+    index: IndexSource,
     fetch: bool,
     threads: usize,
     sender: &Sender<Event>,
@@ -344,7 +337,7 @@ pub fn prepare(
             emit(
                 sender,
                 Event::Preparing(format!(
-                    "Reading saved index: {}",
+                    "读取已保存的扫描快照：{}",
                     platform::display_path(path)
                 )),
             );
@@ -353,11 +346,17 @@ pub fn prepare(
         .transpose()
         .context("load the requested scan index")?;
     let mut raw: BTreeMap<String, Option<Arc<Snapshot>>> = BTreeMap::new();
+    if saved.is_none() && index == IndexSource::Volume {
+        ensure!(
+            platform::elevation::is_elevated(),
+            "读取标记目标需要管理员权限（show-rm 会自己弹出一次 UAC 提权窗口）；只有明确要求普通目录枚举时才加 --index fs。"
+        );
+    }
     for target in &p.plan.targets {
         emit(
             sender,
             Event::Preparing(format!(
-                "Indexing reviewed subtree (fast walk, no hashes): {}",
+                "读取标记目标：{}",
                 platform::display_path(&target.path)
             )),
         );
@@ -383,10 +382,11 @@ pub fn prepare(
             if let Some(index) = saved.as_ref() {
                 return indexed_target(target, index);
             }
-            if let Some(tree) = raw_subtree(target, threads, sender, &mut raw)? {
-                return reviewed_target(target, tree, sender, false);
+            if index == IndexSource::Fs {
+                return capture_light(target, threads, sender);
             }
-            capture_light(target, threads, sender)
+            let tree = raw_subtree(target, threads, sender, &mut raw)?;
+            reviewed_target(target, tree, sender, false)
         })();
         match result {
             Ok(prepared) => {
@@ -751,7 +751,7 @@ pub(crate) fn execute(
     };
     serde_json::to_writer(
         &mut executor.audit,
-        &serde_json::json!({"event":"gui-confirmed-start","time":platform::now_unix(),"revision":prepared.plan.revision,"git_risk_acknowledged":approval.git_acknowledged,"targets":prepared.targets.iter().zip(&approval.selection).flat_map(|(t,s)|s.selected_roots(&t.tree).into_iter().map(move|id|serde_json::json!({"path":t.tree.path(id),"reason":t.target.reason}))).collect::<Vec<_>>()}),
+        &serde_json::json!({"event":"gui-confirmed-start","time":platform::now_unix(),"revision":prepared.plan.revision,"git_risk_acknowledged":approval.git_acknowledged,"targets":prepared.targets.iter().zip(&approval.selection).flat_map(|(t,s)|s.selected_roots(&t.tree).into_iter().map(move|id|serde_json::json!({"path":t.tree.path(id),"reason":t.target.reason,"notes":t.target.alerts}))).collect::<Vec<_>>()}),
     )?;
     executor.audit.write_all(b"\n")?;
     executor.audit.sync_all()?;
@@ -832,6 +832,7 @@ pub(crate) fn execute(
                         errors: 0,
                     },
                     git: t.target.git.clone(),
+                    alerts: t.target.alerts.clone(),
                 });
             }
         }

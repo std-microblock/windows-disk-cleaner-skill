@@ -1,0 +1,46 @@
+#!/bin/sh
+# Auto-format the working tree before every commit: rustfmt + prettier.
+# Enable once per clone:  git config core.hooksPath .githooks
+#
+# Files that are staged are re-added only when they matched the index before
+# formatting, so a partially staged file is never silently expanded.
+set -u
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+tmp=$(mktemp) || exit 1
+trap 'rm -f "$tmp"' EXIT
+: > "$tmp"
+
+git diff --cached --name-only --diff-filter=ACMR | while IFS= read -r file; do
+    if [ -n "$file" ] && [ -f "$file" ] && git diff --quiet -- "$file"; then
+        printf '%s\n' "$file" >> "$tmp"
+    fi
+done
+
+status=0
+
+if command -v cargo >/dev/null 2>&1; then
+    cargo fmt --all || status=1
+else
+    echo "pre-commit: cargo not found; rustfmt skipped" >&2
+    status=1
+fi
+
+if command -v npx >/dev/null 2>&1; then
+    npx --yes prettier@3.8.1 --write README.md THIRD_PARTY_NOTICES.md .prettierrc.json \
+        "skill/**/*.md" "skill/**/*.yaml" "scripts/**/*.mjs" ".github/workflows/*.yml" || status=1
+else
+    echo "pre-commit: npx not found; prettier skipped" >&2
+    status=1
+fi
+
+while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    if ! git diff --quiet -- "$file"; then
+        git add -- "$file"
+        echo "pre-commit: reformatted and re-staged $file"
+    fi
+done < "$tmp"
+
+exit $status
