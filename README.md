@@ -56,20 +56,18 @@ LATEST UTC (max) 是主要列，OLDEST UTC (min) 同时保留。
 - 原始扫描读整卷元数据，小子目录的 fs 可能更快。速度受缓存/记录数/杀毒/存储影响。
 - 在线卷不是冻结的 VSS 快照；分配空间不等于释放量（硬链接/克隆块/元数据）。
 
-## 验证与 skill
+## 打包、发布与安装 skill
 
-    cargo test --all-targets
-    node scripts/validate-fast.mjs
-    node scripts/package-skill.mjs
+    node scripts/package-skill.mjs     # dist/windows-disk-cleaner/：skill 源码 + Release 程序 + 许可
+    node scripts/archive-skill.mjs     # dist/windows-disk-cleaner-skill.zip + dist/SHA256SUMS.txt
+    node scripts/install-skill.mjs     # 安装到本机 skill 目录（默认 ~/.agents/skills，--dest 可改）
 
-validate-fast 必须在管理员上下文运行，只扫描隔离测试数据并写报告。
-skill/windows-disk-cleaner 是 skill 源码与交付目录；package-skill 放入 Release 程序和许可。
-不会自动安装 skill 或改全局配置。
+install-skill 只覆盖目标 skill 目录本身，不动其他 skill 或全局配置；目标已存在时需显式 --force。
 
 只读 UI 预览，没有删除回调：
 
-    .\target\release\disk-cleaner.exe ui-preview --out validation/artifacts/review.png
+    .\target\release\disk-cleaner.exe ui-preview --out dist/review.png
 
-原始 D 盘是 NTFS，映像为 C:\DevDrive.vhdx。独立 ReFS 测试盘由用户授权创建，
-位于 C:\disk-cleaner-validation\refs-test-20260923.vhdx，挂载 E:，动态逻辑 64 GiB。
-未卸载或格式化原始 D 盘。详细第三方信息见 THIRD_PARTY_NOTICES.md。
+push 形如 v0.1.0 的 tag 后，.github/workflows/release.yml 在 windows-latest 上构建、打包，
+并把 skill 包与校验和作为 GitHub Release 附件发布；ci.yml 另跑 cargo fmt --check、
+cargo clippy -D warnings 与 prettier --check。详细第三方信息见 THIRD_PARTY_NOTICES.md。

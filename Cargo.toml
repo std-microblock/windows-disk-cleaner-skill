@@ -6,6 +6,7 @@ rust-version = "1.92"
 license = "Apache-2.0"
 description = "Agent-oriented, read-only-first Windows disk analysis and user-confirmed cleanup"
 build = "build.rs"
+repository = "https://github.com/std-microblock/windows-disk-cleaner-skill"
 
 [features]
 default = ["gui"]
@@ -35,8 +36,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 [build-dependencies]
 slint-build = { version = "=1.18.1", optional = true }
 
-[dev-dependencies]
-tempfile = "3"
 
 [profile.dev]
 debug = 0
