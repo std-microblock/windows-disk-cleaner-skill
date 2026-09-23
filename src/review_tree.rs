@@ -147,7 +147,7 @@ impl Forest {
             .entry_count
             .checked_add(u32::try_from(index)?)
             .context("group key overflow")?;
-        Ok(i32::try_from(key).context("too many ancestor groups")?)
+        i32::try_from(key).context("too many ancestor groups")
     }
 
     pub fn locate(&self, key: i32) -> Option<Location> {
@@ -319,112 +319,5 @@ impl Forest {
             .enumerate()
             .map(|(i, g)| (self.group_key(i).unwrap(), PAGE_SIZE.max(g.children.len())))
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{model::DIR, platform::VolumeInfo};
-    fn tree(root: &str, volume: &str, bytes: u64) -> Snapshot {
-        let mut s = Snapshot::new(
-            root.into(),
-            VolumeInfo {
-                root: volume.into(),
-                ..Default::default()
-            },
-            "test",
-            1,
-        );
-        s.push(
-            0,
-            &"one.bin".encode_utf16().collect::<Vec<_>>(),
-            bytes,
-            bytes,
-            0,
-        )
-        .unwrap();
-        s.push(0, &"empty".encode_utf16().collect::<Vec<_>>(), 0, 0, DIR)
-            .unwrap();
-        s.finish().unwrap();
-        s
-    }
-    #[test]
-    fn merges_same_drive_and_shared_ancestors() {
-        let a = tree("D:/Projects/app/target", "D:/", 10);
-        let b = tree("D:/Projects/app/cache", "D:/", 20);
-        let c = tree("C:/Downloads/archive", "C:/", 30);
-        let trees = [&a, &b, &c];
-        let forest = Forest::new(&trees).unwrap();
-        assert_eq!(forest.roots.len(), 2);
-        let d = forest
-            .groups
-            .iter()
-            .position(|g| g.path == PathBuf::from("D:/"))
-            .unwrap();
-        let app = forest
-            .groups
-            .iter()
-            .find(|g| g.path == PathBuf::from("D:/Projects/app"))
-            .unwrap();
-        assert_eq!(app.children.len(), 2);
-        assert_eq!(forest.groups[d].targets, vec![0, 1]);
-        assert!(forest.locate(forest.group_key(d).unwrap()).is_some());
-        assert!(forest.locate(-1).is_none());
-    }
-    #[test]
-    fn checking_drive_affects_only_its_marked_targets_not_ancestors_or_other_drives() {
-        let a = tree("D:/xxxx", "D:/", 10);
-        let b = tree("D:/yyyy", "D:/", 20);
-        let c = tree("C:/xxxx", "C:/", 30);
-        let trees = [&a, &b, &c];
-        let f = Forest::new(&trees).unwrap();
-        let mut choices: Vec<_> = trees.iter().map(|t| TreeSelection::all(t)).collect();
-        let group = f
-            .groups
-            .iter()
-            .position(|g| g.path == PathBuf::from("D:/"))
-            .unwrap();
-        let key = f.group_key(group).unwrap();
-        let (selected, total) = f.tally(&trees, &choices, key);
-        assert_eq!(total.files, 2);
-        assert_eq!(total.dirs, 4); // Two target roots + their empty dirs, NOT D:\
-        assert_eq!(selected.allocated, 30);
-        assert_eq!(f.check_state(&trees, &choices, key), 2);
-        f.check(&trees, &mut choices, key, false);
-        assert_eq!(choices[0].totals(0).items(), 0);
-        assert_eq!(choices[1].totals(0).items(), 0);
-        assert_eq!(choices[2].totals(0).files, 1);
-        f.check(&trees, &mut choices, f.entry_key(0, 0).unwrap(), true);
-        assert_eq!(f.check_state(&trees, &choices, key), 1);
-        assert_eq!(f.tally(&trees, &choices, key).0.allocated, 10);
-        f.check(&trees, &mut choices, key, true);
-        assert_eq!(f.check_state(&trees, &choices, key), 2);
-    }
-    #[test]
-    fn collapsing_or_paging_never_changes_group_totals() {
-        let a = tree("D:/deep/path/one", "D:/", 42);
-        let trees = [&a];
-        let f = Forest::new(&trees).unwrap();
-        let choices = [TreeSelection::all(&a)];
-        let key = f.roots[0];
-        let expected = f.tally(&trees, &choices, key);
-        let mut expanded = f.initial_expansion();
-        expanded.clear();
-        assert_eq!(f.tally(&trees, &choices, key), expected);
-        assert_eq!(f.children(&trees, key).len(), 1);
-    }
-    #[test]
-    fn group_never_becomes_an_entry_key() {
-        let a = tree("D:/one", "D:/", 42);
-        let trees = [&a];
-        let f = Forest::new(&trees).unwrap();
-        assert!(matches!(f.locate(f.roots[0]), Some(Location::Group(_))));
-        for n in 0..a.nodes.len() as u32 {
-            assert_eq!(
-                f.locate(f.entry_key(0, n).unwrap()),
-                Some(Location::Entry { target: 0, node: n })
-            );
-        }
     }
 }

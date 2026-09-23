@@ -1,0 +1,7 @@
+{
+  "printWidth": 120,
+  "proseWrap": "preserve",
+  "endOfLine": "lf",
+  "semi": true,
+  "singleQuote": false
+}

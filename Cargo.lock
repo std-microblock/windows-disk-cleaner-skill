@@ -1109,7 +1109,6 @@ dependencies = [
  "serde_json",
  "slint",
  "slint-build",
- "tempfile",
  "uuid",
  "windows-sys 0.61.2",
 ]

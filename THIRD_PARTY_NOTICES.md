@@ -22,6 +22,7 @@ traversal and CRC-64/NVME implementation; it does not label the failed USN
 enumeration path as a working fast backend.
 
 ReFS research references (no unlicensed source code copied):
+
 - libyal/libfsrefs structure specification: https://github.com/libyal/libfsrefs
 - ReFS Forensics Reference: https://xbpt.gitlab.io/forefst/concepts/checksum_architecture/
 

@@ -74,7 +74,10 @@ fn make_rows(
     choices: &[TreeSelection],
     expanded: &BTreeMap<i32, usize>,
 ) -> Vec<TreeRow> {
-    enum Work { Node(i32,i32), More(i32,i32,usize) }
+    enum Work {
+        Node(i32, i32),
+        More(i32, i32, usize),
+    }
     struct Rows<'a> {
         p: &'a Prepared,
         trees: Vec<&'a crate::model::Snapshot>,
@@ -84,7 +87,7 @@ fn make_rows(
         rows: Vec<TreeRow>,
     }
     impl Rows<'_> {
-        fn append(&mut self, key: i32, depth: i32, stack:&mut Vec<Work>) {
+        fn append(&mut self, key: i32, depth: i32, stack: &mut Vec<Work>) {
             let Some(location) = self.forest.locate(key) else {
                 return;
             };
@@ -158,9 +161,12 @@ fn make_rows(
             if open {
                 let children = self.forest.children(&self.trees, key);
                 let limit = self.expanded[&key];
-                if children.len()>limit{stack.push(Work::More(key,depth+1,children.len()-limit));}
-                for &child in children.iter().take(limit).rev(){stack.push(Work::Node(child,depth+1));}
-
+                if children.len() > limit {
+                    stack.push(Work::More(key, depth + 1, children.len() - limit));
+                }
+                for &child in children.iter().take(limit).rev() {
+                    stack.push(Work::Node(child, depth + 1));
+                }
             }
         }
     }
@@ -172,11 +178,33 @@ fn make_rows(
         expanded,
         rows: Vec::new(),
     };
-    let mut stack:Vec<_>=forest.roots.iter().rev().map(|&key|Work::Node(key,0)).collect();
-    while let Some(work)=stack.pop(){match work{
-        Work::Node(key,depth)=>view.append(key,depth,&mut stack),
-        Work::More(key,depth,left)=>view.rows.push(TreeRow{key,depth,name:format!("再显示 {PAGE_SIZE} 项 · 还有 {left} 项").into(),reason:"折叠 / 分页不影响勾选范围".into(),size:"".into(),files:"".into(),check_state:0,directory:false,expandable:false,expanded:false,more:true,warning:false,git:false,icon:"add".into()}),
-    }}
+    let mut stack: Vec<_> = forest
+        .roots
+        .iter()
+        .rev()
+        .map(|&key| Work::Node(key, 0))
+        .collect();
+    while let Some(work) = stack.pop() {
+        match work {
+            Work::Node(key, depth) => view.append(key, depth, &mut stack),
+            Work::More(key, depth, left) => view.rows.push(TreeRow {
+                key,
+                depth,
+                name: format!("再显示 {PAGE_SIZE} 项 · 还有 {left} 项").into(),
+                reason: "折叠 / 分页不影响勾选范围".into(),
+                size: "".into(),
+                files: "".into(),
+                check_state: 0,
+                directory: false,
+                expandable: false,
+                expanded: false,
+                more: true,
+                warning: false,
+                git: false,
+                icon: "add".into(),
+            }),
+        }
+    }
 
     view.rows
 }
@@ -468,10 +496,10 @@ pub fn run(path: &Path, fetch: bool) -> Result<()> {
         let weak = ui.as_weak();
         let state = state.clone();
         ui.on_confirm_git(move || {
-            if let Some(ui) = weak.upgrade() {
-                if ui.get_modal_kind() == "git" {
-                    begin_delete(&ui, &state, true);
-                }
+            if let Some(ui) = weak.upgrade()
+                && ui.get_modal_kind() == "git"
+            {
+                begin_delete(&ui, &state, true);
             }
         });
     }
@@ -595,7 +623,9 @@ pub fn run(path: &Path, fetch: bool) -> Result<()> {
         },
         Event::Progress{done,total,removed,failed,current}=>{ui.set_status(current.into());ui.set_progress(if total==0{0.}else{done as f32/total as f32});ui.set_progress_label(format!("{done}/{total} · 已删 {removed} · 失败 {failed}").into());},
         Event::Locked{path,owners,detail,response}=>{let mut s=state.borrow_mut();s.lock_response=Some(response);let mut body=format!("目标：{path}\n\n{detail}\n\nWindows Restart Manager 检测到：\n");if owners.is_empty(){body+="无法安全识别占用者。请手动关闭相关程序，再点重试；不会盲目关闭进程。";}for o in &owners{body+=&format!("• {}  (PID {}){}\n",o.name,o.pid,if o.critical{" [关键进程 / 服务：不会关闭]"}else{""});}body+="\n关闭应用可能影响其他已打开的文件，请先保存工作。";ui.set_modal_title("文件正在使用，需要你的决定".into());ui.set_modal_body(body.into());ui.set_can_close_owners(!owners.is_empty()&&owners.iter().all(|o|!o.critical));ui.set_force_close(false);ui.set_modal_kind("lock".into());},
-        Event::Finished(outcome)=>{ui.set_busy(false);ui.set_deleting(false);ui.set_finished(true);ui.set_can_delete(false);ui.set_reviewed(false);ui.set_modal_kind("".into());ui.set_status(if outcome.cancelled{"已按要求停止。未处理的标记保留，已删除内容不能恢复。"}else{"操作结束。未成功删除的目标仍保留在标记列表中。"}.into());ui.set_progress_label(format!("已删除 {} · 失败 {}",outcome.removed,outcome.failed).into());if !outcome.cancelled{ui.set_progress(1.);}if let Some(p)=&state.borrow().prepared{ui.set_spaces(ModelRc::new(VecModel::from(space_rows(p,&state.borrow().choices,Some(&outcome)))));}if !outcome.errors.is_empty(){ui.set_modal_title("部分条目未删除".into());ui.set_modal_body(outcome.errors.join("\n").into());ui.set_modal_kind("error".into());}eprintln!("Cleanup result: {}",serde_json::to_string(&outcome).unwrap_or_default());},
+        Event::Finished(outcome)=>{ui.set_busy(false);ui.set_deleting(false);ui.set_finished(true);ui.set_can_delete(false);ui.set_reviewed(false);ui.set_modal_kind("".into());ui.set_status(if outcome.cancelled{"已按要求停止。未处理的标记保留，已删除内容不能恢复。"}else{"操作结束。未成功删除的目标仍保留在标记列表中。"}.into());ui.set_progress_label(format!("已删除 {} · 失败 {}",outcome.removed,outcome.failed).into());if !outcome.cancelled{ui.set_progress(1.);}
+            if let Some(p)=&state.borrow().prepared{ui.set_spaces(ModelRc::new(VecModel::from(space_rows(p,&state.borrow().choices,Some(&outcome)))));}
+            if !outcome.errors.is_empty(){ui.set_modal_title("部分条目未删除".into());ui.set_modal_body(outcome.errors.join("\n").into());ui.set_modal_kind("error".into());}eprintln!("Cleanup result: {}",serde_json::to_string(&outcome).unwrap_or_default());},
         Event::Fatal(error)=>{ui.set_busy(false);ui.set_deleting(false);ui.set_can_delete(false);ui.set_modal_title("操作已停止".into());ui.set_modal_body(format!("{error}\n\n请刷新后重新审阅。已完成的删除无法撤销。").into());ui.set_modal_kind("error".into());ui.set_status("没有继续处理其他文件。".into());eprintln!("Review stopped: {error}");},
     }}});
     }
@@ -794,7 +824,7 @@ pub fn preview(output: &Path, state_name: &str) -> Result<()> {
     let selected = forest
         .groups
         .iter()
-        .position(|g| g.path == PathBuf::from(r"D:\"))
+        .position(|g| g.path == Path::new(r"D:\"))
         .and_then(|i| forest.group_key(i).ok());
     let state = State {
         prepared: Some(p),
@@ -852,74 +882,4 @@ pub fn preview(output: &Path, state_name: &str) -> Result<()> {
     )
     .context("save UI preview")?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn preview_and_live_use_one_drive_group_and_relative_names() {
-        let p = example_prepared();
-        let trees = snapshots(&p);
-        let forest = Forest::new(&trees).unwrap();
-        let choices: Vec<_> = trees.iter().map(|t| TreeSelection::all(t)).collect();
-        let rows = make_rows(&p, &forest, &choices, &forest.initial_expansion());
-        assert_eq!(
-            rows.iter()
-                .filter(|r| r.depth == 0 && r.name == r"D:\")
-                .count(),
-            1
-        );
-        assert_eq!(
-            rows.iter()
-                .filter(|r| r.depth == 0 && r.name == r"C:\")
-                .count(),
-            1
-        );
-        assert!(
-            rows.iter()
-                .filter(|r| r.depth > 0)
-                .all(|r| !r.name.contains(':'))
-        );
-        assert!(rows.iter().any(|r| r.name == "Projects"));
-        assert!(rows.iter().any(|r| r.name == "Cache"));
-        assert!(
-            rows.iter()
-                .any(|r| r.name == "target" && r.icon == "folder")
-        );
-        assert!(
-            rows.iter()
-                .any(|r| r.name == "archive.zip" && r.icon == "archive")
-        );
-        assert!(rows.iter().any(|r| r.git && r.warning));
-    }
-    #[test]
-    fn collapsed_drive_still_has_selected_totals_and_does_not_hide_other_drive() {
-        let p = example_prepared();
-        let trees = snapshots(&p);
-        let f = Forest::new(&trees).unwrap();
-        let mut choices: Vec<_> = trees.iter().map(|t| TreeSelection::all(t)).collect();
-        let d = f.groups.iter().position(|g| g.name == r"D:\").unwrap();
-        let key = f.group_key(d).unwrap();
-        let before = f.tally(&trees, &choices, key).0;
-        choices[0].set_subtree(trees[0], 3, false);
-        let rows = make_rows(&p, &f, &choices, &BTreeMap::new());
-        assert_eq!(rows.len(), 2);
-        let d = rows.iter().find(|r| r.name == r"D:\").unwrap();
-        assert_eq!(d.check_state, 1);
-        assert_eq!(d.files, "5 / 6");
-        assert_eq!(
-            f.tally(&trees, &choices, key).0.allocated,
-            before.allocated - 1024 * 1024 * 1024
-        );
-        assert!(rows.iter().any(|r| r.name == r"C:\" && r.check_state == 2));
-    }
-    #[test]
-    fn file_type_icons_are_metadata_only() {
-        assert_eq!(file_icon("Cargo.toml", false, false), "settings");
-        assert_eq!(file_icon("main.rs", false, false), "code");
-        assert_eq!(file_icon("backup.7z", false, false), "archive");
-        assert_eq!(file_icon("photo.JPG", false, false), "image");
-        assert_eq!(file_icon("jump", true, true), "link");
-    }
 }

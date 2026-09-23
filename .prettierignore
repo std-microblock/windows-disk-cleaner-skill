@@ -1,0 +1,7 @@
+/.git/
+/target/
+/dist/
+/licenses/
+/ui/icons/
+*.dcscan
+/clean-targets.json*
