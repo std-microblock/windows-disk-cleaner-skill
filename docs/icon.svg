@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Windows Disk Cleaner">
+  <rect width="64" height="64" rx="14" fill="#0F6CBD"/>
+  <g fill="#FFFFFF">
+    <path d="M14 22h32a5 5 0 0 1 5 5v10a5 5 0 0 1-5 5H14a5 5 0 0 1-5-5V27a5 5 0 0 1 5-5zm0 4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h32a1 1 0 0 0 1-1V27a1 1 0 0 0-1-1H14z"/>
+    <circle cx="21" cy="32" r="4.6"/>
+    <circle cx="36" cy="32" r="1.9"/>
+    <path d="M51 6.5L53.1 11.9L58.5 14L53.1 16.1L51 21.5L48.9 16.1L43.5 14L48.9 11.9Z"/>
+  </g>
+  <circle cx="21" cy="32" r="1.8" fill="#0F6CBD"/>
+</svg>
