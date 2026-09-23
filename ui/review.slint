@@ -1,7 +1,7 @@
 import { Button, CheckBox, ListView, ScrollView, ProgressIndicator, LineEdit, Palette, AboutSlint } from "std-widgets.slint";
 
-export struct TreeRow { key: int, depth: int, name: string, size: string, files: string, check-state: int, reason: string, directory: bool, expandable: bool, expanded: bool, more: bool, warning: bool, git: bool, icon: string, severity: int, alert: string }
-export struct SpaceRow { drive: string, before: string, after: string, before-ratio: float, after-ratio: float }
+export struct TreeRow { key: int, depth: int, name: string, size: string, files: string, check-state: int, reason: string, directory: bool, group: bool, expandable: bool, expanded: bool, more: bool, warning: bool, git: bool, icon: string, severity: int, alert: string }
+export struct SpaceRow { drive: string, before: string, after: string, result: string, before-ratio: float, after-ratio: float }
 
 
 // Slint's built-in Fluent CheckBox has two states. This small tree-only control
@@ -36,6 +36,7 @@ component FileGlyph inherits Image {
     in property <bool> open;
     width: 18px; height: 18px;
     source: kind == "drive" ? @image-url("icons/fluent/drive.svg") :
+        kind == "group-folder" ? (open ? @image-url("icons/fluent/folder-open.svg") : @image-url("icons/fluent/folder.svg")) :
         kind == "folder" ? (open ? @image-url("icons/fluent/folder-open.svg") : @image-url("icons/fluent/folder.svg")) :
         kind == "archive" ? @image-url("icons/fluent/archive.svg") :
         kind == "code" ? @image-url("icons/fluent/code.svg") :
@@ -46,20 +47,21 @@ component FileGlyph inherits Image {
         kind == "audio" ? @image-url("icons/fluent/audio.svg") :
         kind == "link" ? @image-url("icons/fluent/link.svg") :
         kind == "add" ? @image-url("icons/fluent/add.svg") : @image-url("icons/fluent/file.svg");
-    colorize: kind == "folder" ? #be8b13 :
+    colorize: kind == "group-folder" ? Palette.foreground.with-alpha(0.5) : kind == "folder" ? #be8b13 :
         kind == "code" || kind == "image" || kind == "video" ? Palette.accent-background : Palette.foreground.with-alpha(0.72);
     accessible-role: none;
 }
 
 export component ReviewWindow inherits Window {
     title: "Disk Cleaner — 删除确认";
-    preferred-width: 960px; preferred-height: 640px;
-    min-width: 820px; min-height: 520px;
+    preferred-width: 1180px; preferred-height: 760px;
+    min-width: 900px; min-height: 560px;
     background: Palette.background;
     default-font-family: "Segoe UI"; default-font-size: 13px;
 
     in property <[TreeRow]> rows;
     in property <[SpaceRow]> spaces;
+    private property <length> reason-width: 300px;
     in property <string> total-size: "—";
     in property <string> target-count: "0";
     in property <string> item-count: "正在准备…";
@@ -80,6 +82,9 @@ export component ReviewWindow inherits Window {
     in property <string> selected-path: "选择项目查看完整路径";
     in property <string> selected-reason;
     in property <string> selected-alerts;
+    in property <string> selected-alert-preview;
+    in property <int> selected-alert-count: 0;
+    in-out property <bool> alerts-expanded: false;
     // 0 = no note, 1 = warn, 2 = critical
     in property <int> selected-severity: 0;
     in property <bool> can-unmark: false;
@@ -94,6 +99,8 @@ export component ReviewWindow inherits Window {
     callback select-row(int);
     callback refresh(bool);
     callback unmark-selected;
+    callback promote-group(int);
+    callback confirm-promotion;
     callback request-delete;
     callback confirm-git;
     callback cancel-work;
@@ -103,8 +110,8 @@ export component ReviewWindow inherits Window {
         HorizontalLayout { height: 28px; spacing: 12px;
             Image { width: 20px; height: 20px; y: (parent.height - self.height) / 2; source: @image-url("icons/fluent/delete.svg"); colorize: Palette.foreground.with-alpha(0.8); }
             Text { text: root.finished ? "清理结果" : "待删除项目"; font-size: 20px; font-weight: 600; color: Palette.foreground; vertical-alignment: center; }
-            Button { text: "关于"; clicked => { root.modal-kind = "about"; } }
-            Text { text: root.preview ? "示例预览 · 不会执行删除" : root.deleting ? "正在删除…" : root.finished ? "操作已结束" : "仅标记，尚未删除"; color: Palette.foreground.with-alpha(0.6); horizontal-alignment: right; vertical-alignment: center; font-size: 12px; }
+            Text { text: root.preview ? "示例预览 · 不会执行删除" : root.deleting ? "正在删除…" : root.finished ? "操作已结束" : "仅标记，尚未删除"; color: Palette.foreground.with-alpha(0.6); horizontal-alignment: right; vertical-alignment: center; font-size: 12px; horizontal-stretch: 1; }
+            Button { text: "关于"; width: 50px; height: 26px; clicked => { root.modal-kind = "about"; } }
         }
         HorizontalLayout { height: 32px; spacing: 8px;
             Button { text: "刷新"; icon: @image-url("icons/fluent/refresh.svg"); icon-size: 16px; colorize-icon: true; enabled: !root.busy; clicked => { if !root.preview { root.refresh(false); } } }
@@ -120,9 +127,18 @@ export component ReviewWindow inherits Window {
                 Rectangle { height: 34px; background: Palette.alternate-background.with-alpha(0.5);
                     HorizontalLayout { padding-left: 88px; padding-right: 16px; spacing: 18px;
                         Text { text: "名称"; color: Palette.foreground.with-alpha(0.65); vertical-alignment: center; }
-                        Text { text: "待删大小"; width: 100px; color: Palette.foreground.with-alpha(0.65); horizontal-alignment: right; vertical-alignment: center; }
+                        Text { text: "待删大小（已选 / 总数）"; width: 160px; color: Palette.foreground.with-alpha(0.65); horizontal-alignment: right; vertical-alignment: center; }
                         Text { text: "文件（已选 / 总数）"; width: 122px; color: Palette.foreground.with-alpha(0.65); horizontal-alignment: right; vertical-alignment: center; }
-                        Text { text: "原因 / 状态"; width: 200px; color: Palette.foreground.with-alpha(0.65); vertical-alignment: center; }
+                        Rectangle { width: root.reason-width;
+                            Text { x: 8px; width: parent.width - 8px; text: "原因 / 状态"; horizontal-alignment: left; color: Palette.foreground.with-alpha(0.65); vertical-alignment: center; }
+                            // Drag the left edge of the last column; the name column flexes.
+                            Rectangle { x: 0; width: 1px; height: parent.height; background: resize-reason.has-hover ? Palette.accent-background : Palette.foreground.with-alpha(0.12); }
+                            resize-reason := TouchArea { x: -5px; width: 10px; height: parent.height; mouse-cursor: ew-resize;
+                                moved => {
+                                    if self.pressed { root.reason-width = max(180px, min(600px, root.reason-width - (self.mouse-x - self.pressed-x))); }
+                                }
+                            }
+                        }
                     }
                 }
                 tree := ListView { for item in root.rows : Rectangle { height: 34px; width: tree.visible-width;
@@ -134,7 +150,21 @@ export component ReviewWindow inherits Window {
                     accessible-item-selected: root.selected-key == item.key && !item.more;
                     accessible-action-default => { if item.more { root.toggle-row(item.key, true); } else { root.select-row(item.key); } }
                     if root.selected-key == item.key && !item.more : Rectangle { x: 0; y: 9px; width: 3px; height: 16px; border-radius: 2px; background: Palette.accent-background; }
-                    row-touch := TouchArea { clicked => { if item.more { root.toggle-row(item.key, true); } else { root.select-row(item.key); } } }
+                    row-touch := TouchArea {
+                        clicked => { if item.more { root.toggle-row(item.key, true); } else { root.select-row(item.key); } }
+                        pointer-event(event) => {
+                            if event.button == PointerEventButton.right && event.kind == PointerEventKind.down && item.group && item.icon != "drive" && !root.busy && !root.finished && !root.preview && root.modal-kind == "" {
+                                root.select-row(item.key);
+                                row-menu.show();
+                            }
+                        }
+                    }
+                    row-menu := PopupWindow {
+                        x: 72px; y: 26px; width: 235px; height: 42px; close-policy: close-on-click-outside;
+                        Rectangle { background: Palette.background; border-width: 1px; border-color: Palette.foreground.with-alpha(0.2); border-radius: 4px;
+                            Button { x: 4px; y: 4px; width: 227px; height: 34px; text: "将整个目录标记为删除对象…"; clicked => { row-menu.close(); root.promote-group(item.key); } }
+                        }
+                    }
                     HorizontalLayout { padding-left: 10px + item.depth * 16px; padding-right: 16px; spacing: 18px;
                         HorizontalLayout { spacing: 6px;
                             Rectangle { width: 18px;
@@ -147,9 +177,9 @@ export component ReviewWindow inherits Window {
                             FileGlyph { kind: item.icon; open: item.expanded; y: (parent.height - self.height) / 2; }
                             Text { text: item.name; color: item.more ? Palette.accent-background : Palette.foreground; overflow: elide; vertical-alignment: center; }
                         }
-                        Text { text: item.size; width: 100px; horizontal-alignment: right; vertical-alignment: center; color: Palette.foreground.with-alpha(0.8); }
+                        Text { text: item.size; width: 160px; horizontal-alignment: right; vertical-alignment: center; color: Palette.foreground.with-alpha(0.8); }
                         Text { text: item.files; width: 122px; horizontal-alignment: right; vertical-alignment: center; color: Palette.foreground.with-alpha(0.7); }
-                        HorizontalLayout { width: 200px; spacing: 5px;
+                        HorizontalLayout { width: root.reason-width; spacing: 5px;
                             if item.severity > 0 : Rectangle { width: 36px; height: 18px; border-radius: 9px; y: (parent.height - self.height) / 2; background: item.severity == 2 ? #c42b1c : #9a5b00; Text { text: item.severity == 2 ? "严重" : "注意"; color: #ffffff; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; } }
                             if item.git : Image { width: 14px; height: 14px; y: (parent.height - self.height) / 2; source: @image-url("icons/fluent/git.svg"); colorize: Palette.foreground.with-alpha(0.65); }
                             if item.warning : Image { width: 14px; height: 14px; y: (parent.height - self.height) / 2; source: @image-url("icons/fluent/warning.svg"); colorize: #a55f13; }
@@ -160,18 +190,43 @@ export component ReviewWindow inherits Window {
                 if root.rows.length == 0 : Text { text: root.busy ? "正在读取文件清单…" : "没有待删除项目"; color: Palette.foreground.with-alpha(0.55); horizontal-alignment: center; height: 56px; }
             }
         }
-        VerticalLayout { spacing: 5px; vertical-stretch: 0;
+        VerticalLayout { spacing: 8px; vertical-stretch: 0;
             LineEdit { text: root.selected-path; read-only: true; }
-            Text { text: root.selected-reason; font-size: 11px; color: Palette.foreground.with-alpha(0.6); overflow: elide; }
-            if root.selected-alerts != "" : Text { text: root.selected-alerts; font-size: 11px; font-weight: root.selected-severity == 2 ? 600 : 400; color: root.selected-severity == 2 ? #c42b1c : #8a5a00; overflow: elide; }
-        }
-        VerticalLayout { spacing: 4px; vertical-stretch: 0;
-            for space in root.spaces : HorizontalLayout { height: 19px; spacing: 12px;
-                Text { text: space.drive; width: 32px; color: Palette.foreground.with-alpha(0.7); }
-                Text { text: space.before + "  →  " + space.after; color: Palette.foreground.with-alpha(0.7); font-size: 12px; }
-                Text { text: ""; horizontal-stretch: 1; }
+            if root.selected-reason != "" : Text { height: 22px; text: root.selected-reason; color: Palette.foreground.with-alpha(0.76); font-size: 12px; overflow: elide; vertical-alignment: center; }
+            if root.selected-alert-count > 0 : Rectangle {
+                height: root.alerts-expanded ? 148px : 52px;
+                border-radius: 8px;
+                background: root.selected-severity == 2 ? #c42b1c10 : #9a5b0010;
+                border-width: 1px;
+                border-color: root.selected-severity == 2 ? #c42b1c30 : #9a5b002c;
+                VerticalLayout { x: 12px; y: 7px; width: parent.width - 24px; height: parent.height - 14px; spacing: 4px;
+                    Rectangle { width: parent.width; height: 17px;
+                        Image { x: 0; y: 2px; width: 14px; height: 14px; source: @image-url("icons/fluent/warning.svg"); colorize: root.selected-severity == 2 ? #b42318 : #8a5a00; }
+                        Text { x: 20px; text: (root.selected-severity == 2 ? "严重风险" : "注意") + " · " + root.selected-alert-count + " 条"; font-size: 12px; font-weight: 600; color: root.selected-severity == 2 ? #b42318 : #8a5a00; vertical-alignment: center; }
+                        Text { x: parent.width - 72px; width: 72px; text: root.alerts-expanded ? "收起" : "查看详情"; horizontal-alignment: right; font-size: 12px; color: Palette.accent-background; vertical-alignment: center; }
+                        TouchArea { x: parent.width - 84px; width: 84px; mouse-cursor: pointer; clicked => { root.alerts-expanded = !root.alerts-expanded; } }
+                    }
+                    if !root.alerts-expanded : Text { text: root.selected-alert-preview; font-size: 12px; color: Palette.foreground.with-alpha(0.84); overflow: elide; vertical-alignment: center; }
+                    if root.alerts-expanded : ScrollView { vertical-stretch: 1;
+                        Text { text: root.selected-alerts; width: parent.width; wrap: word-wrap; font-size: 12px; color: Palette.foreground.with-alpha(0.88); }
+                    }
+                }
             }
-            Text { text: "实际释放可能较少（硬链接 / 共享块）。"; color: Palette.foreground.with-alpha(0.5); font-size: 11px; }
+            HorizontalLayout { height: 43px; spacing: 10px;
+                for space in root.spaces : Rectangle {
+                    width: 265px; height: 43px; border-radius: 6px;
+                    background: Palette.alternate-background.with-alpha(0.55);
+                    border-width: 1px; border-color: Palette.foreground.with-alpha(0.08);
+                    HorizontalLayout { padding-left: 12px; padding-right: 12px; spacing: 8px;
+                        Text { text: space.drive; width: 28px; font-size: 12px; font-weight: 600; color: Palette.foreground; vertical-alignment: center; }
+                        Rectangle { width: 1px; height: 19px; y: (parent.height - self.height) / 2; background: Palette.foreground.with-alpha(0.13); }
+                        Text { text: space.before + "  →  " + space.after; font-size: 12px; color: Palette.foreground.with-alpha(0.8); vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: space.result; font-size: 11px; color: Palette.foreground.with-alpha(0.55); vertical-alignment: center; }
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
         }
         if root.busy || root.finished : VerticalLayout { spacing: 7px; vertical-stretch: 0;
             HorizontalLayout { spacing: 12px;
@@ -203,6 +258,8 @@ export component ReviewWindow inherits Window {
                 Rectangle { height: 1px; background: Palette.foreground.with-alpha(0.08); }
                 Rectangle { height: 70px; background: Palette.alternate-background.with-alpha(0.5);
                     HorizontalLayout { padding: 20px; spacing: 8px; alignment: end;
+                        if root.modal-kind == "promote" : Button { text: "取消"; clicked => { root.modal-kind = ""; } }
+                        if root.modal-kind == "promote" : Button { text: "扩大标记范围"; primary: true; clicked => { root.confirm-promotion(); } }
                         if root.modal-kind == "git" : Button { text: "返回"; clicked => { root.modal-kind = ""; } }
                         if root.modal-kind == "git" : Button { text: "仍然删除本地数据"; primary: true; clicked => { root.confirm-git(); } }
                         if root.modal-kind == "lock" : Button { text: "跳过"; clicked => { root.lock-choice(0); } }

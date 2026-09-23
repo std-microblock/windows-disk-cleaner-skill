@@ -26,6 +26,8 @@ struct State {
     forest: Forest,
     expanded: BTreeMap<i32, usize>,
     selected: Option<i32>,
+    pending_promotion: Option<i32>,
+    snapshot_identity: Option<platform::Identity>,
     lock_response: Option<SyncSender<LockDecision>>,
     cancel: Arc<AtomicBool>,
     path: PathBuf,
@@ -145,7 +147,7 @@ fn make_rows(
                         },
                         true,
                         !g.children.is_empty(),
-                        if g.drive { "drive" } else { "folder" },
+                        if g.drive { "drive" } else { "group-folder" },
                         g.targets.iter().any(|&t| target_git_risk(self.p, t)),
                         false,
                         g.targets
@@ -196,11 +198,17 @@ fn make_rows(
                 key,
                 depth,
                 name: report::safe_text(&name).into(),
-                size: report::human(selected.allocated).into(),
+                size: format!(
+                    "{} / {}",
+                    report::human(selected.allocated),
+                    report::human(total.allocated)
+                )
+                .into(),
                 files: format!("{} / {}", selected.files, total.files).into(),
                 check_state: self.forest.check_state(&self.trees, self.choices, key),
                 reason: report::safe_text(&reason).into(),
                 directory,
+                group: matches!(location, Location::Group(_)),
                 expandable,
                 expanded: open,
                 more: false,
@@ -248,6 +256,7 @@ fn make_rows(
                 files: "".into(),
                 check_state: 0,
                 directory: false,
+                group: false,
                 expandable: false,
                 expanded: false,
                 more: true,
@@ -287,16 +296,13 @@ fn space_rows(p: &Prepared, choices: &[TreeSelection], outcome: Option<&Outcome>
                 });
             SpaceRow {
                 drive: platform::display_path(&volume.root).into(),
-                before: format!("删除前可用 {}", report::human(before.free_bytes)).into(),
-                after: format!(
-                    "{}可用 {}",
-                    if outcome.is_some() {
-                        "实测"
-                    } else {
-                        "预计"
-                    },
-                    report::human(after)
-                )
+                before: report::human(before.free_bytes).into(),
+                after: report::human(after).into(),
+                result: if outcome.is_some() {
+                    "实测"
+                } else {
+                    "预计"
+                }
                 .into(),
                 before_ratio: if before.total_bytes == 0 {
                     0.
@@ -324,46 +330,103 @@ fn show_selection(ui: &ReviewWindow, s: &State) {
     };
     ui.set_selected_key(key);
     ui.set_selected_path(platform::display_path(&path).into());
-    let (selected, total) = s.forest.tally(&trees, &s.choices, key);
-    let (explanation, alerts, severity) = match s.forest.locate(key).unwrap() {
-        Location::Group(_) => (
-            "分组节点本身不会删除；勾选仅影响其下已标记内容。".to_owned(),
-            String::new(),
-            0,
-        ),
-        Location::Entry { target, .. } => {
-            let t = &p.targets[target].target;
-            (
-                format!(
-                    "原因：{}",
-                    if t.reason.is_empty() {
-                        "未填写"
-                    } else {
-                        &t.reason
+    let (explanation, alerts, preview, note_count, severity) = match s.forest.locate(key).unwrap() {
+        Location::Group(group) => {
+            let targets = &s.forest.groups[group].targets;
+            let note_count: usize = targets
+                .iter()
+                .map(|&ti| p.targets[ti].target.alerts.len())
+                .sum();
+            let preview = plan::Level::WORST_FIRST
+                .iter()
+                .find_map(|&level| {
+                    targets.iter().find_map(|&ti| {
+                        p.targets[ti]
+                            .target
+                            .alerts
+                            .iter()
+                            .find(|a| a.level == level)
+                            .map(|a| report::safe_text(&a.text))
+                    })
+                })
+                .unwrap_or_default();
+            let mut notes = Vec::new();
+            for level in plan::Level::WORST_FIRST {
+                for &ti in targets {
+                    let t = &p.targets[ti].target;
+                    for a in t.alerts.iter().filter(|a| a.level == level) {
+                        if notes.len() < 32 {
+                            notes.push(format!(
+                                "{}  ·  {}\n{}",
+                                a.level.label(),
+                                platform::display_path(&t.path),
+                                report::safe_text(&a.text)
+                            ));
+                        }
                     }
-                ),
-                t.alerts
-                    .iter()
-                    .map(|a| format!("[{}] {}", a.level.label(), report::safe_text(&a.text)))
-                    .collect::<Vec<_>>()
-                    .join("    "),
-                severity_of(t),
+                }
+            }
+            if note_count > notes.len() {
+                notes.push(format!(
+                    "另有 {} 条提示；选择具体对象查看。",
+                    note_count - notes.len()
+                ));
+            }
+            let severity = targets
+                .iter()
+                .map(|&ti| severity_of(&p.targets[ti].target))
+                .max()
+                .unwrap_or(0);
+            (
+                String::new(),
+                notes.join("\n\n"),
+                preview,
+                note_count,
+                severity,
+            )
+        }
+        Location::Entry { target, node } => {
+            let t = &p.targets[target].target;
+            let preview = plan::Level::WORST_FIRST
+                .iter()
+                .find_map(|&level| {
+                    t.alerts
+                        .iter()
+                        .find(|a| a.level == level)
+                        .map(|a| report::safe_text(&a.text))
+                })
+                .unwrap_or_default();
+            (
+                if node == 0 {
+                    if t.reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!("原因：{}", t.reason)
+                    }
+                } else {
+                    String::new()
+                },
+                if node == 0 {
+                    t.alerts
+                        .iter()
+                        .map(|a| format!("{}\n{}", a.level.label(), report::safe_text(&a.text)))
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                } else {
+                    String::new()
+                },
+                if node == 0 { preview } else { String::new() },
+                if node == 0 { t.alerts.len() } else { 0 },
+                if node == 0 { severity_of(t) } else { 0 },
             )
         }
     };
+    ui.set_alerts_expanded(false);
     ui.set_selected_severity(severity);
+    ui.set_selected_alert_count(note_count as i32);
+    ui.set_selected_alert_preview(preview.into());
     ui.set_selected_alerts(alerts.into());
-    ui.set_selected_reason(
-        format!(
-            "{explanation}  已选 {} / {} 文件、{} / {} 文件夹 · {}",
-            selected.files,
-            total.files,
-            selected.dirs,
-            total.dirs,
-            report::human(selected.allocated)
-        )
-        .into(),
-    );
+    ui.set_selected_reason(explanation.into());
     ui.set_can_unmark(!s.forest.target_indices(key).is_empty());
 }
 
@@ -381,8 +444,28 @@ fn refresh_selection(ui: &ReviewWindow, s: &State) {
         let bytes: u64 = s.choices.iter().map(|c| c.totals(0).allocated).sum();
         let files: u64 = s.choices.iter().map(|c| c.totals(0).files as u64).sum();
         let dirs: u64 = s.choices.iter().map(|c| c.totals(0).dirs as u64).sum();
-        ui.set_total_size(report::human(bytes).into());
-        ui.set_item_count(format!("已选 {files} 文件 / {dirs} 文件夹").into());
+        ui.set_total_size(
+            format!(
+                "{} / {}",
+                report::human(bytes),
+                report::human(p.allocated_upper_bound)
+            )
+            .into(),
+        );
+        ui.set_item_count(
+            format!(
+                "已选 {files} / {} 文件、{dirs} / {} 文件夹",
+                p.targets
+                    .iter()
+                    .map(|t| t.tree.nodes[0].files as u64)
+                    .sum::<u64>(),
+                p.targets
+                    .iter()
+                    .map(|t| t.tree.nodes[0].dirs as u64)
+                    .sum::<u64>()
+            )
+            .into(),
+        );
         ui.set_can_delete(p.can_delete() && files + dirs > 0);
         ui.set_reviewed(false);
     }
@@ -404,6 +487,7 @@ fn refresh(ui: &ReviewWindow, state: &Rc<RefCell<State>>, fetch: bool) {
     s.forest = Forest::default();
     s.expanded.clear();
     s.selected = None;
+    s.pending_promotion = None;
     let path = s.path.clone();
     let snapshot = s.snapshot.clone();
     let source = s.source;
@@ -425,6 +509,42 @@ fn refresh(ui: &ReviewWindow, state: &Rc<RefCell<State>>, fetch: bool) {
         }
     });
 }
+/// Only retire the task-local scan index after every marked target was handled.
+/// Never remove an arbitrary external snapshot or one replaced during review.
+fn cleanup_snapshot_after_success(s: &State, outcome: &Outcome) -> Option<String> {
+    if outcome.cancelled || outcome.failed > 0 || !outcome.errors.is_empty() {
+        return None;
+    }
+    let snapshot = s.snapshot.as_ref()?;
+    let original = s.snapshot_identity.as_ref()?;
+    if snapshot.extension().is_none_or(|ext| ext != "dcscan") {
+        return None;
+    }
+    let plan_parent = s.path.parent()?;
+    let actual_parent = platform::canonical(snapshot.parent()?).ok()?;
+    let actual_plan_parent = platform::canonical(plan_parent).ok()?;
+    if !platform::within(&actual_parent, &actual_plan_parent) {
+        return None;
+    }
+    let store = plan::Store::open(&s.path).ok()?;
+    if !store.plan.targets.is_empty() {
+        return None;
+    }
+    drop(store);
+    let current = platform::identity(snapshot).ok()?;
+    if current.is_reparse()
+        || !current.same_file(original)
+        || current.length != original.length
+        || current.modified != original.modified
+    {
+        return None;
+    }
+    match std::fs::remove_file(snapshot) {
+        Ok(()) => Some("任务快照已自动清理。".into()),
+        Err(e) => Some(format!("快照清理失败（删除结果不受影响）：{e}")),
+    }
+}
+
 fn begin_delete(ui: &ReviewWindow, state: &Rc<RefCell<State>>, git_ack: bool) {
     if ui.get_busy() || ui.get_preview() || !ui.get_reviewed() {
         return;
@@ -468,7 +588,8 @@ pub fn run(
     source: deletion::IndexSource,
     fetch: bool,
 ) -> Result<()> {
-    let index = snapshot.map(Path::to_path_buf);
+    let index = snapshot.map(platform::absolute).transpose()?;
+    let snapshot_identity = index.as_ref().map(|p| platform::identity(p)).transpose()?;
     let ui = ReviewWindow::new()?;
     let (tx, rx) = mpsc::channel();
     let path = platform::absolute(path)?;
@@ -479,6 +600,8 @@ pub fn run(
         forest: Forest::default(),
         expanded: BTreeMap::new(),
         selected: None,
+        pending_promotion: None,
+        snapshot_identity,
         lock_response: None,
         cancel: Arc::new(AtomicBool::new(false)),
         path,
@@ -565,6 +688,73 @@ pub fn run(
                     ui.set_modal_kind("error".into());
                 }
             }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_promote_group(move |key| {
+            let Some(ui) = weak.upgrade() else { return; };
+            if ui.get_busy() || ui.get_finished() || ui.get_preview() { return; }
+            let mut s = state.borrow_mut();
+            let Some(Location::Group(group)) = s.forest.locate(key) else { return; };
+            if s.forest.groups[group].drive { return; }
+            let path = platform::display_path(&s.forest.groups[group].path);
+            let count = s.forest.groups[group].targets.len();
+            s.pending_promotion = Some(key);
+            ui.set_modal_title("扩大删除标记范围？".into());
+            ui.set_modal_body(format!(
+                "当前分组：{path}\n\n目前的复选框只控制下方 {count} 个已标记目标；分组目录本身不会被删除。\n\n升级后将撤销这些子目标标记，改为标记整个目录，包括当前未标记的文件和子目录。窗口会重新读取清单，所有勾选与永久删除确认均需重新进行。\n\n仅在你确认整个目录都不再需要时继续。"
+            ).into());
+            ui.set_modal_kind("promote".into());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_confirm_promotion(move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_modal_kind() != "promote" || ui.get_busy() || ui.get_preview() {
+                return;
+            }
+            let mut s = state.borrow_mut();
+            let (Some(key), Some(p)) = (s.pending_promotion.take(), s.prepared.as_ref()) else {
+                return;
+            };
+            let Some(Location::Group(group)) = s.forest.locate(key) else {
+                return;
+            };
+            if s.forest.groups[group].drive {
+                return;
+            }
+            let group_path = s.forest.groups[group].path.clone();
+            let revision = p.plan.revision;
+            let path = s.path.clone();
+            let snapshot = s.snapshot.clone();
+            let threads = s.threads;
+            let tx = s.sender.clone();
+            s.cancel = Arc::new(AtomicBool::new(false));
+            let cancel = s.cancel.clone();
+            ui.set_modal_kind("".into());
+            ui.set_busy(true);
+            ui.set_can_delete(false);
+            ui.set_reviewed(false);
+            ui.set_status("正在核对整个目录并更新标记（没有删除文件）…".into());
+            std::thread::spawn(move || {
+                let result = plan::promote_group(
+                    &path,
+                    &group_path,
+                    revision,
+                    snapshot.as_deref(),
+                    threads,
+                    &cancel,
+                )
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(Event::PromotionResult(result));
+            });
         });
     }
     {
@@ -727,12 +917,13 @@ pub fn run(
         let state = state.clone();
         timer.start(slint::TimerMode::Repeated,Duration::from_millis(40),move||{let Some(ui)=weak.upgrade()else{return;};for event in rx.try_iter(){match event{
         Event::Preparing(message)=>ui.set_status(message.into()),
+        Event::PromotionResult(result)=>match result { Ok(())=>refresh(&ui,&state,false), Err(error)=>{ui.set_busy(false);ui.set_can_delete(false);ui.set_modal_title("扩大标记失败".into());ui.set_modal_body(format!("{error}\n\n没有删除文件；请刷新后重新审阅标记。" ).into());ui.set_modal_kind("error".into());} },
         Event::Ready(p)=>{
             let mut s=state.borrow_mut();s.choices=p.targets.iter().map(|t|TreeSelection::all(&t.tree)).collect();match Forest::new(&snapshots(&p)){Ok(forest)=>{s.expanded=forest.initial_expansion();s.forest=forest;},Err(e)=>{ui.set_busy(false);ui.set_can_delete(false);ui.set_modal_title("无法构建文件树".into());ui.set_modal_body(format!("{e:#}").into());ui.set_modal_kind("error".into());continue;}}ui.set_rows(ModelRc::new(VecModel::from(make_rows(&p,&s.forest,&s.choices,&s.expanded))));ui.set_spaces(ModelRc::new(VecModel::from(space_rows(&p,&s.choices,None))));ui.set_total_size(report::human(p.allocated_upper_bound).into());ui.set_target_count(p.targets.len().to_string().into());ui.set_item_count(format!("{} 个文件 / 文件夹对象",p.total_items).into());let risks=p.git.iter().filter(|g|g.needs_confirmation()).count();ui.set_git_risk(risks>0);ui.set_git_title(if risks>0{format!("{risks} 处待确认")}else{"检查完成".into()}.into());ui.set_git_detail(if p.git.is_empty(){"未发现相关 Git 仓库"}else if risks>0{"包含本地数据或尚未核实远端"}else{"本次检查未发现未同步内容"}.into());ui.set_busy(false);ui.set_deleting(false);ui.set_can_delete(p.can_delete());ui.set_status(if p.problems.is_empty(){"请展开检查目标，然后勾选确认。".into()}else{format!("{} 项安全校验未通过，禁止执行。",p.problems.len()).into()});ui.set_progress_label("尚未删除任何文件".into());if !p.problems.is_empty(){ui.set_modal_title("需要先处理这些问题".into());ui.set_modal_body(p.problems.join("\n\n").into());ui.set_modal_kind("error".into());}s.selected=s.forest.roots.first().copied();s.prepared=Some(p);refresh_selection(&ui,&s);show_selection(&ui,&s);
         },
         Event::Progress{done,total,removed,failed,current}=>{ui.set_status(current.into());ui.set_progress(if total==0{0.}else{done as f32/total as f32});ui.set_progress_label(format!("{done}/{total} · 已删 {removed} · 失败 {failed}").into());},
         Event::Locked{path,owners,detail,response}=>{let mut s=state.borrow_mut();s.lock_response=Some(response);let mut body=format!("目标：{path}\n\n{detail}\n\nWindows Restart Manager 检测到：\n");if owners.is_empty(){body+="无法安全识别占用者。请手动关闭相关程序，再点重试；不会盲目关闭进程。";}for o in &owners{body+=&format!("• {}  (PID {}){}\n",o.name,o.pid,if o.critical{" [关键进程 / 服务：不会关闭]"}else{""});}body+="\n关闭应用可能影响其他已打开的文件，请先保存工作。";ui.set_modal_title("文件正在使用，需要你的决定".into());ui.set_modal_body(body.into());ui.set_can_close_owners(!owners.is_empty()&&owners.iter().all(|o|!o.critical));ui.set_force_close(false);ui.set_modal_kind("lock".into());},
-        Event::Finished(outcome)=>{ui.set_busy(false);ui.set_deleting(false);ui.set_finished(true);ui.set_can_delete(false);ui.set_reviewed(false);ui.set_modal_kind("".into());ui.set_status(if outcome.cancelled{"已按要求停止。未处理的标记保留，已删除内容不能恢复。"}else{"操作结束。未成功删除的目标仍保留在标记列表中。"}.into());ui.set_progress_label(format!("已删除 {} · 失败 {}",outcome.removed,outcome.failed).into());if !outcome.cancelled{ui.set_progress(1.);}
+        Event::Finished(outcome)=>{let snapshot_note=cleanup_snapshot_after_success(&state.borrow(),&outcome);ui.set_busy(false);ui.set_deleting(false);ui.set_finished(true);ui.set_can_delete(false);ui.set_reviewed(false);ui.set_modal_kind("".into());ui.set_status(if outcome.cancelled{"已按要求停止。未处理的标记保留，已删除内容不能恢复。"}else{"操作结束。未成功删除的目标仍保留在标记列表中。"}.into());ui.set_progress_label(format!("已删除 {} · 失败 {}{}",outcome.removed,outcome.failed,snapshot_note.as_deref().map(|n|format!(" · {n}")).unwrap_or_default()).into());if !outcome.cancelled{ui.set_progress(1.);}
             if let Some(p)=&state.borrow().prepared{ui.set_spaces(ModelRc::new(VecModel::from(space_rows(p,&state.borrow().choices,Some(&outcome)))));}
             if !outcome.errors.is_empty(){ui.set_modal_title("部分条目未删除".into());ui.set_modal_body(outcome.errors.join("\n").into());ui.set_modal_kind("error".into());}eprintln!("Cleanup result: {}",serde_json::to_string(&outcome).unwrap_or_default());},
         Event::Fatal(error)=>{ui.set_busy(false);ui.set_deleting(false);ui.set_can_delete(false);ui.set_modal_title("操作已停止".into());ui.set_modal_body(format!("{error}\n\n请刷新后重新审阅。已完成的删除无法撤销。").into());ui.set_modal_kind("error".into());ui.set_status("没有继续处理其他文件。".into());eprintln!("Review stopped: {error}");},
@@ -951,6 +1142,8 @@ pub fn preview(output: &Path, state_name: &str) -> Result<()> {
         forest,
         expanded,
         selected,
+        pending_promotion: None,
+        snapshot_identity: None,
         lock_response: None,
         cancel: Arc::new(AtomicBool::new(false)),
         snapshot: None,
@@ -964,6 +1157,9 @@ pub fn preview(output: &Path, state_name: &str) -> Result<()> {
     ui.set_plan_path("示例数据；不会读取或删除真实文件".into());
     refresh_selection(&ui, &state);
     show_selection(&ui, &state);
+    if state_name == "notes-expanded" {
+        ui.set_alerts_expanded(true);
+    }
     if state_name == "git" {
         ui.set_modal_kind("git".into());
         ui.set_modal_title("Git 数据需要第二次确认".into());

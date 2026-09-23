@@ -97,6 +97,7 @@ pub struct Outcome {
 pub enum Event {
     Preparing(String),
     Ready(Arc<Prepared>),
+    PromotionResult(std::result::Result<(), String>),
     Fatal(String),
     Progress {
         done: u64,

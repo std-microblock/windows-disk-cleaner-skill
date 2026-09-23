@@ -321,3 +321,64 @@ impl Forest {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{model::DIR, platform::VolumeInfo};
+
+    #[test]
+    fn group_checkbox_only_changes_marked_targets() {
+        let volume = VolumeInfo {
+            root: r"D:\".into(),
+            ..Default::default()
+        };
+        let mut a = Snapshot::new(
+            r"D:\Research\Celeste\first".into(),
+            volume.clone(),
+            "test",
+            1,
+        );
+        a.push(
+            0,
+            &"one.bin".encode_utf16().collect::<Vec<_>>(),
+            100,
+            100,
+            0,
+        )
+        .unwrap();
+        a.finish().unwrap();
+        let mut b = Snapshot::new(r"D:\Research\Celeste\second".into(), volume, "test", 1);
+        b.nodes[0].flags = DIR;
+        b.push(
+            0,
+            &"two.bin".encode_utf16().collect::<Vec<_>>(),
+            200,
+            200,
+            0,
+        )
+        .unwrap();
+        b.finish().unwrap();
+        let trees = [&a, &b];
+        let forest = Forest::new(&trees).unwrap();
+        let group = forest
+            .groups
+            .iter()
+            .position(|g| g.path == std::path::Path::new(r"D:\Research\Celeste"))
+            .unwrap();
+        let key = forest.group_key(group).unwrap();
+        let mut choices = trees
+            .iter()
+            .map(|t| TreeSelection::all(t))
+            .collect::<Vec<_>>();
+        assert_eq!(forest.target_indices(key), vec![0, 1]);
+        forest.check(&trees, &mut choices, key, false);
+        assert_eq!(forest.check_state(&trees, &choices, key), 0);
+        assert_eq!(forest.tally(&trees, &choices, key).0.allocated, 0);
+        assert_eq!(forest.tally(&trees, &choices, key).1.allocated, 300);
+        forest.check(&trees, &mut choices, key, true);
+        assert_eq!(forest.check_state(&trees, &choices, key), 2);
+        assert_eq!(forest.tally(&trees, &choices, key).0.allocated, 300);
+        assert!(matches!(forest.locate(key), Some(Location::Group(_))));
+    }
+}

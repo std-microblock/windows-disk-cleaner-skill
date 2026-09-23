@@ -19,8 +19,8 @@
 - --no-git 只跳过报告注释，绝不能关闭删除安全检查。
 - --no-save 用于一次性只读扫描；--json 提供有界结构化报告而不是海量文件全量输出。
 - detail 是缓存快照，可能过期；审阅窗口用 --snapshot 复用已有索引时同样可能过期。
-- show-rm 索引顺序：显式 --snapshot → 卷原始索引（NTFS/ReFS，按卷缓存，同一窗口内多个目标只读一次）→ 只有显式 --index fs 时才走目录枚举。
-- show-rm 默认自动提权：需要读卷原始元数据时会自己弹一次 UAC（agent 不需要额外加 --elevate，也不要点 UAC 按钮）。用 --snapshot 或 --index fs 则不请求提权。
+- show-rm 索引顺序：显式 --snapshot → 当前任务 `.disk-cleaner/last.dcscan`（完整且覆盖全部标记时自动复用）→ 卷原始索引（NTFS/ReFS，按卷缓存，同一窗口内多个目标只读一次）→ 只有显式 --index fs 时才走目录枚举。
+- show-rm 默认自动提权：需要读卷原始元数据时会自己弹一次 UAC（agent 不需要额外加 --elevate，也不要点 UAC 按钮）。复用快照或用 --index fs 则不请求提权。
 - 审阅树不含哈希；实际删除前对每个勾选对象重新打开防替换句柄，核对类型/大小/修改时间，变化过的对象跳过并报告。
 - 时间列同时显示 LATEST UTC (max) 与 OLDEST UTC (min)，文件夹统计后代文件、文件两者相同。v2 缓存可从保存的逐文件时间自动补算 max，不需要重新扫描；v1 缓存缺失时间，需重新扫描。
 - compare LEFT.dcscan RIGHT.dcscan --scope PATH 对照完整子树，而非屏幕截断的行。
@@ -55,8 +55,10 @@ all_content_synced=true 才是本次审计没有发现工作区本地数据、�
 - 不支持通配符、ADS 路径、设备路径、卷根、受保护的 OS 路径，或穿越 junction/symlink 的父目录。
 - 默认计划可用全局 --plan PATH 改变。计划有并发锁、schema 和 revision，使用原子替换保存。
 - 没有 --yes、execute、force-delete、隐藏的无头删除入口。
-- show-rm 在文件树里高亮 rm 的 warn/critical 提示：行内“注意 / 严重”标记 + 底色，选中行下方给出完整文字；不弹窗，也不阻止删除。
+- show-rm 在文件树里高亮 rm 的 warn/critical 提示：行内“注意 / 严重”标记 + 底色，选中行下方显示摘要，可展开查看全文；不弹窗，也不阻止删除。
 - show-rm --text 用 `!!` / `!` 前缀与 `CRITICAL:` / `WARN:` 行标出提示；show-rm --json 在 `targets[].alerts` 中保留原文（`level` 为 warn 或 critical）。
+- 分组目录的灰色图标与实际标记目录的金色图标不同；分组复选框仍批量选择其下已标记目标。右键分组可经范围确认后升级为整个目录的标记，然后必须重新审阅、勾选。
+- 所有目标成功处理且标记计划清空后，自动删除计划目录内未被替换的 `.dcscan`；取消、失败、保留标记或外部快照都不会自动清理。
 - show-rm --fetch 可以在审阅准备阶段核实 remote。agent 只负责打开窗口，所有破坏性决定交给用户。
 - 占用处理使用 Restart Manager；关键进程/服务和本程序不会被关闭，无法识别占用者时要求用户手动处理。
 

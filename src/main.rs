@@ -49,7 +49,7 @@ enum Command {
     UiPreview {
         #[arg(long)]
         out: PathBuf,
-        #[arg(long,default_value="review",value_parser=["review","git","lock","progress","notes"])]
+        #[arg(long,default_value="review",value_parser=["review","git","lock","progress","notes","notes-expanded"])]
         state: String,
     },
     /// Scan a volume (fast) or subtree (fs); save the complete, lossless drill-down index.
@@ -447,11 +447,36 @@ fn run(cli: Cli) -> Result<i32> {
             } else {
                 #[cfg(feature = "gui")]
                 {
+                    // Reuse the current task's saved scan when it covers every mark.
+                    // A missing, stale or unrelated index leaves the existing raw-index
+                    // path untouched; an explicit --snapshot still reports its errors.
+                    let review_snapshot = snapshot.or_else(|| {
+                        if index == disk_cleaner::deletion::IndexSource::Fs {
+                            return None;
+                        }
+                        let candidate = PathBuf::from(".disk-cleaner/last.dcscan");
+                        let store = plan::Store::open(&cli.plan).ok()?;
+                        if store.plan.targets.is_empty() {
+                            return None;
+                        }
+                        let index = Snapshot::load(&candidate).ok()?;
+                        if !index.stats.complete
+                            || store
+                                .plan
+                                .targets
+                                .iter()
+                                .any(|t| index.find(&t.path).is_err())
+                        {
+                            return None;
+                        }
+                        println!("Reusing saved review snapshot: {}", candidate.display());
+                        Some(candidate)
+                    });
                     // The review window reads the volume's raw metadata, so it asks for
                     // administrator rights itself (one UAC prompt). A saved snapshot or an
                     // explicit --index fs walk needs no elevation at all.
                     #[cfg(windows)]
-                    if snapshot.is_none()
+                    if review_snapshot.is_none()
                         && index == disk_cleaner::deletion::IndexSource::Volume
                         && !platform::elevation::is_elevated()
                     {
@@ -463,7 +488,7 @@ fn run(cli: Cli) -> Result<i32> {
                     println!(
                         "Opening human review. The agent must NOT click deletion/close-process confirmations."
                     );
-                    disk_cleaner::gui::run(&cli.plan, snapshot.as_deref(), index, fetch)?;
+                    disk_cleaner::gui::run(&cli.plan, review_snapshot.as_deref(), index, fetch)?;
                 }
                 #[cfg(not(feature = "gui"))]
                 bail!(

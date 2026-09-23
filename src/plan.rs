@@ -465,6 +465,114 @@ pub fn stage(
     }
     Ok(additions)
 }
+/// Replace exactly the marked descendants of a reviewed group with its full directory.
+/// This is a staging operation only; the user must review the newly expanded tree
+/// and confirm deletion separately. Reject a changed plan rather than widening it.
+pub fn promote_group(
+    plan_path: &Path,
+    path: &Path,
+    reviewed_revision: uuid::Uuid,
+    snapshot: Option<&Path>,
+    threads: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Target> {
+    let mut store = Store::open(plan_path)?;
+    ensure!(
+        store.plan.revision == reviewed_revision,
+        "plan changed; refresh before expanding a group"
+    );
+    let (path, identity) = validate_target(path, &store.path)?;
+    ensure!(
+        identity.is_dir() && !identity.is_reparse(),
+        "only a real directory group can be promoted"
+    );
+    let descendants: Vec<_> = store
+        .plan
+        .targets
+        .iter()
+        .filter(|t| {
+            platform::within(&t.path, &path)
+                && platform::path_key(&t.path) != platform::path_key(&path)
+        })
+        .collect();
+    ensure!(!descendants.is_empty(), "group has no marked descendants");
+    ensure!(
+        store
+            .plan
+            .targets
+            .iter()
+            .all(|t| !platform::within(&path, &t.path)),
+        "an ancestor or the same directory is already marked"
+    );
+    let tree = if let Some(index) = snapshot {
+        Snapshot::load(index)?.subtree(&path)?
+    } else {
+        scan::fs::scan_light(
+            &path,
+            platform::volume_info(&path)?,
+            threads,
+            768 * 1024 * 1024,
+            None,
+        )?
+    };
+    ensure!(
+        tree.stats.complete,
+        "group indexing was incomplete; nothing was marked"
+    );
+    let summary = Summary::from_snapshot(&tree);
+    ensure!(
+        summary.errors == 0,
+        "group indexing was incomplete; nothing was marked"
+    );
+    let git = git_audit::inspect(&path, false).unwrap_or_else(|e| {
+        Some(GitAudit {
+            root: path.clone(),
+            risks: vec![format!("Git check failed: {e:#}")],
+            ..Default::default()
+        })
+    });
+    let (_, current) = validate_target(&path, &store.path)?;
+    ensure!(
+        current.same_file(&identity),
+        "group changed during indexing; refresh before marking"
+    );
+    let mut alerts = Vec::new();
+    for alert in descendants.iter().flat_map(|t| &t.alerts) {
+        if !alerts.contains(alert) {
+            alerts.push(alert.clone());
+        }
+    }
+    ensure!(
+        alerts.len() <= MAX_ALERTS,
+        "too many distinct notes to preserve; review targets separately"
+    );
+    let target = Target {
+        id: uuid::Uuid::new_v4(),
+        path: path.clone(),
+        reason: format!(
+            "用户在审阅窗口将分组扩大为整个目录（替代 {} 个子目标）",
+            descendants.len()
+        ),
+        marked_unix: platform::now_unix(),
+        identity,
+        summary,
+        git,
+        alerts,
+    };
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Relaxed),
+        "group promotion cancelled; no mark changed"
+    );
+    // The plan stays locked throughout indexing; cancellation is checked before saving.
+    store
+        .plan
+        .targets
+        .retain(|t| !platform::within(&t.path, &path));
+    store.plan.targets.push(target.clone());
+    store.save()?;
+    Ok(target)
+}
+
 pub fn undo(plan_path: &Path, paths: &[PathBuf], all: bool) -> Result<usize> {
     let mut store = Store::open(plan_path)?;
     let keys = paths
