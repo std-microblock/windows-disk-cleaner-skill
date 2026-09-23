@@ -17,9 +17,12 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Sender, SyncSender},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 slint::include_modules!();
+mod dialogs;
+mod eta;
+use dialogs::Dialog;
 struct State {
     prepared: Option<Arc<Prepared>>,
     choices: Vec<TreeSelection>,
@@ -29,6 +32,7 @@ struct State {
     pending_promotion: Option<i32>,
     snapshot_identity: Option<platform::Identity>,
     lock_response: Option<SyncSender<LockDecision>>,
+    eta: Option<eta::DeleteEta>,
     cancel: Arc<AtomicBool>,
     path: PathBuf,
     snapshot: Option<PathBuf>,
@@ -479,6 +483,8 @@ fn refresh(ui: &ReviewWindow, state: &Rc<RefCell<State>>, fetch: bool) {
     ui.set_reviewed(false);
     ui.set_modal_kind("".into());
     ui.set_progress(0.);
+    ui.set_eta_label("".into());
+    ui.set_progress_label("尚未删除任何文件".into());
     ui.set_status("正在准备只读审阅快照…".into());
     let mut s = state.borrow_mut();
     s.cancel = Arc::new(AtomicBool::new(false));
@@ -556,13 +562,12 @@ fn begin_delete(ui: &ReviewWindow, state: &Rc<RefCell<State>>, git_ack: bool) {
     let approval = match Approval::from_gui(&p, &s.choices, git_ack) {
         Ok(a) => a,
         Err(e) => {
-            ui.set_modal_title("不能开始删除".into());
-            ui.set_modal_body(e.to_string().into());
-            ui.set_modal_kind("error".into());
+            Dialog::approval_error(&e.to_string()).show(ui);
             return;
         }
     };
     s.cancel = Arc::new(AtomicBool::new(false));
+    s.eta = Some(eta::DeleteEta::new(Instant::now()));
     let cancel = s.cancel.clone();
     let tx = s.sender.clone();
     ui.set_modal_kind("".into());
@@ -570,6 +575,7 @@ fn begin_delete(ui: &ReviewWindow, state: &Rc<RefCell<State>>, git_ack: bool) {
     ui.set_deleting(true);
     ui.set_can_delete(false);
     ui.set_progress(0.);
+    ui.set_eta_label("".into());
     ui.set_status("正在复核标记目录；随后逐项按句柄核对并删除".into());
     std::thread::spawn(
         move || match deletion::execute(p, approval, cancel, tx.clone()) {
@@ -582,6 +588,226 @@ fn begin_delete(ui: &ReviewWindow, state: &Rc<RefCell<State>>, git_ack: bool) {
         },
     );
 }
+fn apply_event(ui: &ReviewWindow, state: &Rc<RefCell<State>>, event: Event) {
+    match event {
+        Event::Preparing(message) => ui.set_status(message.into()),
+        Event::PromotionResult(result) => match result {
+            Ok(()) => refresh(ui, state, false),
+            Err(error) => {
+                ui.set_busy(false);
+                ui.set_can_delete(false);
+                Dialog::error(
+                    "扩大标记失败",
+                    "目录标记没有更新，请刷新后重新审阅。",
+                    &[error],
+                    "没有删除文件。",
+                )
+                .show(ui);
+            }
+        },
+        Event::Ready(prepared) => {
+            let mut s = state.borrow_mut();
+            s.choices = prepared
+                .targets
+                .iter()
+                .map(|t| TreeSelection::all(&t.tree))
+                .collect();
+            match Forest::new(&snapshots(&prepared)) {
+                Ok(forest) => {
+                    s.expanded = forest.initial_expansion();
+                    s.forest = forest;
+                }
+                Err(error) => {
+                    ui.set_busy(false);
+                    ui.set_can_delete(false);
+                    Dialog::error(
+                        "无法构建文件树",
+                        "审阅清单不完整，不能开始删除。请刷新后重试。",
+                        &[format!("{error:#}")],
+                        "没有删除文件。",
+                    )
+                    .show(ui);
+                    return;
+                }
+            }
+            ui.set_rows(ModelRc::new(VecModel::from(make_rows(
+                &prepared,
+                &s.forest,
+                &s.choices,
+                &s.expanded,
+            ))));
+            ui.set_spaces(ModelRc::new(VecModel::from(space_rows(
+                &prepared, &s.choices, None,
+            ))));
+            ui.set_total_size(report::human(prepared.allocated_upper_bound).into());
+            ui.set_target_count(prepared.targets.len().to_string().into());
+            ui.set_item_count(format!("{} 个文件 / 文件夹对象", prepared.total_items).into());
+            let risks = prepared
+                .git
+                .iter()
+                .filter(|g| g.needs_confirmation())
+                .count();
+            ui.set_git_risk(risks > 0);
+            ui.set_git_title(
+                if risks > 0 {
+                    format!("{risks} 处待确认")
+                } else {
+                    "检查完成".into()
+                }
+                .into(),
+            );
+            ui.set_git_detail(
+                if prepared.git.is_empty() {
+                    "未发现相关 Git 仓库"
+                } else if risks > 0 {
+                    "包含本地数据或尚未核实远端"
+                } else {
+                    "本次检查未发现未同步内容"
+                }
+                .into(),
+            );
+            ui.set_busy(false);
+            ui.set_deleting(false);
+            ui.set_can_delete(prepared.can_delete());
+            ui.set_status(if prepared.problems.is_empty() {
+                "请展开检查目标，然后勾选确认。".into()
+            } else {
+                format!("{} 项安全校验未通过，禁止执行。", prepared.problems.len()).into()
+            });
+            ui.set_progress_label("尚未删除任何文件".into());
+            ui.set_eta_label("".into());
+            if !prepared.problems.is_empty() {
+                Dialog::error(
+                    "需要先处理这些问题",
+                    format!(
+                        "{} 项安全问题阻止删除。请逐项检查，修复后刷新。",
+                        prepared.problems.len()
+                    ),
+                    &prepared.problems,
+                    "在问题解决之前，不会允许删除。",
+                )
+                .show(ui);
+            }
+            s.selected = s.forest.roots.first().copied();
+            s.prepared = Some(prepared);
+            refresh_selection(ui, &s);
+            show_selection(ui, &s);
+        }
+        Event::Progress {
+            done,
+            total,
+            removed,
+            failed,
+            current,
+        } => {
+            ui.set_status(current.into());
+            ui.set_progress(if total == 0 {
+                0.
+            } else {
+                done as f32 / total as f32
+            });
+            ui.set_progress_label(
+                format!("{done}/{total} · 已删 {removed} · 失败 {failed}").into(),
+            );
+            let mut s = state.borrow_mut();
+            let estimate = if s.cancel.load(Ordering::Relaxed) {
+                String::new()
+            } else {
+                s.eta
+                    .as_mut()
+                    .map(|eta| eta.observe(Instant::now(), done, total))
+                    .unwrap_or_default()
+            };
+            ui.set_eta_label(estimate.into());
+        }
+        Event::Locked {
+            path,
+            owners,
+            detail,
+            response,
+        } => {
+            let mut s = state.borrow_mut();
+            s.lock_response = Some(response);
+            if let Some(eta) = s.eta.as_mut() {
+                eta.pause(Instant::now());
+            }
+            ui.set_eta_label("".into());
+            Dialog::locked(&path, &owners, &detail).show(ui);
+        }
+        Event::Finished(outcome) => {
+            let snapshot_note = cleanup_snapshot_after_success(&state.borrow(), &outcome);
+            state.borrow_mut().eta = None;
+            ui.set_busy(false);
+            ui.set_deleting(false);
+            ui.set_finished(true);
+            ui.set_can_delete(false);
+            ui.set_reviewed(false);
+            ui.set_modal_kind("".into());
+            ui.set_eta_label("".into());
+            ui.set_status(
+                if outcome.cancelled {
+                    "已按要求停止。未处理的标记保留，已删除内容不能恢复。"
+                } else {
+                    "操作结束。未成功删除的目标仍保留在标记列表中。"
+                }
+                .into(),
+            );
+            ui.set_progress_label(
+                format!(
+                    "已删除 {} · 失败 {}{}",
+                    outcome.removed,
+                    outcome.failed,
+                    snapshot_note
+                        .as_deref()
+                        .map(|n| format!(" · {n}"))
+                        .unwrap_or_default(),
+                )
+                .into(),
+            );
+            if !outcome.cancelled {
+                ui.set_progress(1.);
+            }
+            let s = state.borrow();
+            if let Some(prepared) = &s.prepared {
+                ui.set_spaces(ModelRc::new(VecModel::from(space_rows(
+                    prepared,
+                    &s.choices,
+                    Some(&outcome),
+                ))));
+            }
+            drop(s);
+            if !outcome.errors.is_empty() {
+                Dialog::partial_outcome(&outcome).show(ui);
+            }
+            eprintln!(
+                "Cleanup result: {}",
+                serde_json::to_string(&outcome).unwrap_or_default()
+            );
+        }
+        Event::Fatal(error) => {
+            let was_deleting = ui.get_deleting();
+            state.borrow_mut().eta = None;
+            ui.set_busy(false);
+            ui.set_deleting(false);
+            ui.set_can_delete(false);
+            ui.set_eta_label("".into());
+            ui.set_status("没有继续处理其他文件。".into());
+            Dialog::error(
+                "操作已停止",
+                "已停止处理其他文件。请刷新并重新审阅，再决定是否重试。",
+                std::slice::from_ref(&error),
+                if was_deleting {
+                    "已完成的删除无法撤销。"
+                } else {
+                    "尚未开始删除。"
+                },
+            )
+            .show(ui);
+            eprintln!("Review stopped: {error}");
+        }
+    }
+}
+
 pub fn run(
     path: &Path,
     snapshot: Option<&Path>,
@@ -603,6 +829,7 @@ pub fn run(
         pending_promotion: None,
         snapshot_identity,
         lock_response: None,
+        eta: None,
         cancel: Arc::new(AtomicBool::new(false)),
         path,
         snapshot: index,
@@ -610,6 +837,16 @@ pub fn run(
         sender: tx,
         threads: 8,
     }));
+    {
+        let weak = ui.as_weak();
+        ui.on_show_about(move || {
+            if let Some(ui) = weak.upgrade()
+                && !ui.get_busy()
+            {
+                Dialog::about().show(&ui);
+            }
+        });
+    }
     {
         let weak = ui.as_weak();
         let state = state.clone();
@@ -683,9 +920,13 @@ pub fn run(
             match result {
                 Ok(_) => refresh(&ui, &state, false),
                 Err(e) => {
-                    ui.set_modal_title("取消标记失败".into());
-                    ui.set_modal_body(format!("{e:#}").into());
-                    ui.set_modal_kind("error".into());
+                    Dialog::error(
+                        "取消标记失败",
+                        "标记没有更改，请检查问题后重试。",
+                        &[format!("{e:#}")],
+                        "没有删除文件。",
+                    )
+                    .show(&ui);
                 }
             }
         });
@@ -694,19 +935,23 @@ pub fn run(
         let weak = ui.as_weak();
         let state = state.clone();
         ui.on_promote_group(move |key| {
-            let Some(ui) = weak.upgrade() else { return; };
-            if ui.get_busy() || ui.get_finished() || ui.get_preview() { return; }
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_busy() || ui.get_finished() || ui.get_preview() {
+                return;
+            }
             let mut s = state.borrow_mut();
-            let Some(Location::Group(group)) = s.forest.locate(key) else { return; };
-            if s.forest.groups[group].drive { return; }
-            let path = platform::display_path(&s.forest.groups[group].path);
+            let Some(Location::Group(group)) = s.forest.locate(key) else {
+                return;
+            };
+            if s.forest.groups[group].drive {
+                return;
+            }
+            let path = s.forest.groups[group].path.clone();
             let count = s.forest.groups[group].targets.len();
             s.pending_promotion = Some(key);
-            ui.set_modal_title("扩大删除标记范围？".into());
-            ui.set_modal_body(format!(
-                "当前分组：{path}\n\n目前的复选框只控制下方 {count} 个已标记目标；分组目录本身不会被删除。\n\n升级后将撤销这些子目标标记，改为标记整个目录，包括当前未标记的文件和子目录。窗口会重新读取清单，所有勾选与永久删除确认均需重新进行。\n\n仅在你确认整个目录都不再需要时继续。"
-            ).into());
-            ui.set_modal_kind("promote".into());
+            Dialog::promotion(&path, count).show(&ui);
         });
     }
     {
@@ -767,26 +1012,18 @@ pub fn run(
             if ui.get_busy() || !ui.get_reviewed() {
                 return;
             }
-            let Some(p) = state.borrow().prepared.clone() else {
+            let s = state.borrow();
+            let Some(p) = s.prepared.as_ref() else {
                 return;
             };
-            if deletion::selected_git_risk(&p, &state.borrow().choices) {
-                let mut body = String::from("以下仓库存在未同步、本地独有或无法核实的数据。忽略项也可能包含重要文件；它们不会因为被 gitignore 就变得安全。\n\n");
-                for g in deletion::selected_git(&p, &state.borrow().choices) {
-                    if g.needs_confirmation() {
-                        body += &format!(
-                            "{}\n{}\n{}\n\n",
-                            platform::display_path(&g.root),
-                            g.concise(),
-                            g.risks.join("\n")
-                        );
-                    }
-                }
-                body += "继续后，这些标记路径中的本地内容将被永久删除。";
-                ui.set_modal_title("Git 数据需要第二次确认".into());
-                ui.set_modal_body(body.into());
-                ui.set_modal_kind("git".into());
+            let risks: Vec<_> = deletion::selected_git(p, &s.choices)
+                .into_iter()
+                .filter(|g| g.needs_confirmation())
+                .collect();
+            if !risks.is_empty() {
+                Dialog::git(&risks).show(&ui);
             } else {
+                drop(s);
                 begin_delete(&ui, &state, false);
             }
         });
@@ -821,6 +1058,10 @@ pub fn run(
             }
             ui.set_modal_kind("".into());
             ui.set_force_close(false);
+            if let Some(eta) = s.eta.as_mut() {
+                eta.resume(Instant::now());
+                ui.set_eta_label("".into());
+            }
         });
     }
     {
@@ -836,6 +1077,9 @@ pub fn run(
                     }
                     ui.set_modal_kind("".into());
                     ui.set_status("正在安全停止；已完成的删除无法撤销…".into());
+                    if ui.get_deleting() {
+                        ui.set_eta_label("".into());
+                    }
                 } else {
                     let _ = ui.hide();
                 }
@@ -857,6 +1101,9 @@ pub fn run(
                 }
                 ui.set_modal_kind("".into());
                 ui.set_status("正在安全停止，完成当前操作后可关闭。".into());
+                if ui.get_deleting() {
+                    ui.set_eta_label("".into());
+                }
                 slint::CloseRequestResponse::KeepWindowShown
             } else {
                 slint::CloseRequestResponse::HideWindow
@@ -915,19 +1162,28 @@ pub fn run(
     {
         let weak = ui.as_weak();
         let state = state.clone();
-        timer.start(slint::TimerMode::Repeated,Duration::from_millis(40),move||{let Some(ui)=weak.upgrade()else{return;};for event in rx.try_iter(){match event{
-        Event::Preparing(message)=>ui.set_status(message.into()),
-        Event::PromotionResult(result)=>match result { Ok(())=>refresh(&ui,&state,false), Err(error)=>{ui.set_busy(false);ui.set_can_delete(false);ui.set_modal_title("扩大标记失败".into());ui.set_modal_body(format!("{error}\n\n没有删除文件；请刷新后重新审阅标记。" ).into());ui.set_modal_kind("error".into());} },
-        Event::Ready(p)=>{
-            let mut s=state.borrow_mut();s.choices=p.targets.iter().map(|t|TreeSelection::all(&t.tree)).collect();match Forest::new(&snapshots(&p)){Ok(forest)=>{s.expanded=forest.initial_expansion();s.forest=forest;},Err(e)=>{ui.set_busy(false);ui.set_can_delete(false);ui.set_modal_title("无法构建文件树".into());ui.set_modal_body(format!("{e:#}").into());ui.set_modal_kind("error".into());continue;}}ui.set_rows(ModelRc::new(VecModel::from(make_rows(&p,&s.forest,&s.choices,&s.expanded))));ui.set_spaces(ModelRc::new(VecModel::from(space_rows(&p,&s.choices,None))));ui.set_total_size(report::human(p.allocated_upper_bound).into());ui.set_target_count(p.targets.len().to_string().into());ui.set_item_count(format!("{} 个文件 / 文件夹对象",p.total_items).into());let risks=p.git.iter().filter(|g|g.needs_confirmation()).count();ui.set_git_risk(risks>0);ui.set_git_title(if risks>0{format!("{risks} 处待确认")}else{"检查完成".into()}.into());ui.set_git_detail(if p.git.is_empty(){"未发现相关 Git 仓库"}else if risks>0{"包含本地数据或尚未核实远端"}else{"本次检查未发现未同步内容"}.into());ui.set_busy(false);ui.set_deleting(false);ui.set_can_delete(p.can_delete());ui.set_status(if p.problems.is_empty(){"请展开检查目标，然后勾选确认。".into()}else{format!("{} 项安全校验未通过，禁止执行。",p.problems.len()).into()});ui.set_progress_label("尚未删除任何文件".into());if !p.problems.is_empty(){ui.set_modal_title("需要先处理这些问题".into());ui.set_modal_body(p.problems.join("\n\n").into());ui.set_modal_kind("error".into());}s.selected=s.forest.roots.first().copied();s.prepared=Some(p);refresh_selection(&ui,&s);show_selection(&ui,&s);
-        },
-        Event::Progress{done,total,removed,failed,current}=>{ui.set_status(current.into());ui.set_progress(if total==0{0.}else{done as f32/total as f32});ui.set_progress_label(format!("{done}/{total} · 已删 {removed} · 失败 {failed}").into());},
-        Event::Locked{path,owners,detail,response}=>{let mut s=state.borrow_mut();s.lock_response=Some(response);let mut body=format!("目标：{path}\n\n{detail}\n\nWindows Restart Manager 检测到：\n");if owners.is_empty(){body+="无法安全识别占用者。请手动关闭相关程序，再点重试；不会盲目关闭进程。";}for o in &owners{body+=&format!("• {}  (PID {}){}\n",o.name,o.pid,if o.critical{" [关键进程 / 服务：不会关闭]"}else{""});}body+="\n关闭应用可能影响其他已打开的文件，请先保存工作。";ui.set_modal_title("文件正在使用，需要你的决定".into());ui.set_modal_body(body.into());ui.set_can_close_owners(!owners.is_empty()&&owners.iter().all(|o|!o.critical));ui.set_force_close(false);ui.set_modal_kind("lock".into());},
-        Event::Finished(outcome)=>{let snapshot_note=cleanup_snapshot_after_success(&state.borrow(),&outcome);ui.set_busy(false);ui.set_deleting(false);ui.set_finished(true);ui.set_can_delete(false);ui.set_reviewed(false);ui.set_modal_kind("".into());ui.set_status(if outcome.cancelled{"已按要求停止。未处理的标记保留，已删除内容不能恢复。"}else{"操作结束。未成功删除的目标仍保留在标记列表中。"}.into());ui.set_progress_label(format!("已删除 {} · 失败 {}{}",outcome.removed,outcome.failed,snapshot_note.as_deref().map(|n|format!(" · {n}")).unwrap_or_default()).into());if !outcome.cancelled{ui.set_progress(1.);}
-            if let Some(p)=&state.borrow().prepared{ui.set_spaces(ModelRc::new(VecModel::from(space_rows(p,&state.borrow().choices,Some(&outcome)))));}
-            if !outcome.errors.is_empty(){ui.set_modal_title("部分条目未删除".into());ui.set_modal_body(outcome.errors.join("\n").into());ui.set_modal_kind("error".into());}eprintln!("Cleanup result: {}",serde_json::to_string(&outcome).unwrap_or_default());},
-        Event::Fatal(error)=>{ui.set_busy(false);ui.set_deleting(false);ui.set_can_delete(false);ui.set_modal_title("操作已停止".into());ui.set_modal_body(format!("{error}\n\n请刷新后重新审阅。已完成的删除无法撤销。").into());ui.set_modal_kind("error".into());ui.set_status("没有继续处理其他文件。".into());eprintln!("Review stopped: {error}");},
-    }}});
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(80),
+            move || {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                for event in rx.try_iter() {
+                    apply_event(&ui, &state, event);
+                }
+                if ui.get_deleting() && ui.get_modal_kind().is_empty() {
+                    let s = state.borrow();
+                    if !s.cancel.load(Ordering::Relaxed)
+                        && s.eta
+                            .as_ref()
+                            .is_some_and(|eta| eta.is_stalled(Instant::now()))
+                    {
+                        ui.set_eta_label("".into());
+                    }
+                }
+            },
+        );
     }
     refresh(&ui, &state, fetch);
     ui.run()?;
@@ -937,7 +1193,15 @@ pub fn run(
 
 /// Representative metadata only. This creates NO files and shares the production
 /// forest/selection/row builder, so previews cannot conceal grouping regressions.
+///
+/// Paths, reasons and sizes mirror one real review; filler objects keep the
+/// "selected / total" counts honest, because a real build tree holds thousands of
+/// small objects and the published screenshots should show a genuine review.
 fn example_prepared() -> Prepared {
+    assemble().expect("build the example review snapshot")
+}
+
+fn assemble() -> Result<Prepared> {
     use crate::{
         deletion::PreparedTarget,
         git_audit::GitAudit,
@@ -947,126 +1211,191 @@ fn example_prepared() -> Prepared {
     };
     let gib = 1024 * 1024 * 1024u64;
     let mib = 1024 * 1024u64;
+    let kib = 1024u64;
+    fn dir(tree: &mut Snapshot, parent: u32, name: &str) -> Result<u32> {
+        tree.push(parent, &name.encode_utf16().collect::<Vec<_>>(), 0, 0, DIR)
+    }
+    fn file(tree: &mut Snapshot, parent: u32, name: &str, bytes: u64) -> Result<u32> {
+        tree.push(
+            parent,
+            &name.encode_utf16().collect::<Vec<_>>(),
+            bytes,
+            bytes,
+            0,
+        )
+    }
+    // Thousands of small objects, exactly like a real build tree. The review window
+    // only renders their rolled-up rows, but the counts have to stay believable.
+    fn pad(
+        tree: &mut Snapshot,
+        parent: u32,
+        count: u32,
+        seed: u64,
+        min: u64,
+        max: u64,
+        name: impl Fn(u32) -> String,
+    ) -> Result<()> {
+        let mut state = seed | 1;
+        for index in 0..count {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let size = min + (state >> 17) % (max - min + 1);
+            let hash = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 33;
+            file(tree, parent, &name(hash as u32), size)?;
+        }
+        Ok(())
+    }
     let d = VolumeInfo {
         root: r"D:\".into(),
         filesystem: "NTFS".into(),
-        serial: 1,
-        total_bytes: 200 * gib,
-        free_bytes: 6 * gib,
+        serial: 0x3f21_a904,
+        total_bytes: 1863 * gib,
+        free_bytes: 6 * gib + 194 * mib,
+        cluster_bytes: 4096,
         ..Default::default()
     };
     let c = VolumeInfo {
         root: r"C:\".into(),
         filesystem: "NTFS".into(),
-        serial: 2,
-        total_bytes: 2 * 1024 * gib,
-        free_bytes: 1024 * gib,
+        serial: 0x1d2e_7b40,
+        total_bytes: 953 * gib,
+        free_bytes: 58 * gib + 52 * mib,
+        cluster_bytes: 4096,
         ..Default::default()
     };
-    let mut build = Snapshot::new(
-        r"D:\Projects\target".into(),
+    let mut target = Snapshot::new(
+        r"D:\celeste-research\MicroblocksQolUtils\target".into(),
         d.clone(),
-        "example-metadata",
-        1,
+        "ntfs",
+        8,
     );
-    let debug = build
-        .push(0, &"debug".encode_utf16().collect::<Vec<_>>(), 0, 0, DIR)
-        .unwrap();
-    build
-        .push(
-            debug,
-            &"sample-app.exe".encode_utf16().collect::<Vec<_>>(),
-            2 * gib,
-            2 * gib,
-            0,
-        )
-        .unwrap();
-    build
-        .push(
-            debug,
-            &"sample-app.pdb".encode_utf16().collect::<Vec<_>>(),
-            gib,
-            gib,
-            0,
-        )
-        .unwrap();
-    let release = build
-        .push(0, &"release".encode_utf16().collect::<Vec<_>>(), 0, 0, DIR)
-        .unwrap();
-    build
-        .push(
-            release,
-            &"sample-app.exe".encode_utf16().collect::<Vec<_>>(),
-            gib,
-            gib,
-            0,
-        )
-        .unwrap();
-    build
-        .push(
-            0,
-            &"build.log".encode_utf16().collect::<Vec<_>>(),
-            24 * mib,
-            24 * mib,
-            0,
-        )
-        .unwrap();
-    build.finish().unwrap();
-    let mut cache = Snapshot::new(
-        r"D:\Cache\build-history".into(),
+    let debug = dir(&mut target, 0, "debug")?;
+    let deps = dir(&mut target, debug, "deps")?;
+    pad(
+        &mut target,
+        deps,
+        5412,
+        0x9e37_79b9,
+        48 * kib,
+        2 * mib,
+        |h| format!("libceleste_tools-{h:08x}.rlib"),
+    )?;
+    let incremental = dir(&mut target, debug, "incremental")?;
+    pad(
+        &mut target,
+        incremental,
+        4806,
+        0x85eb_ca6b,
+        16 * kib,
+        512 * kib,
+        |h| format!("s-h3df1zx02y-{h:08x}.bin"),
+    )?;
+    let fingerprint = dir(&mut target, debug, ".fingerprint")?;
+    pad(
+        &mut target,
+        fingerprint,
+        1214,
+        0xc2b2_ae35,
+        kib,
+        64 * kib,
+        |h| format!("celeste-tools-{h:08x}.json"),
+    )?;
+    let build = dir(&mut target, debug, "build")?;
+    pad(
+        &mut target,
+        build,
+        312,
+        0x27d4_eb2f,
+        8 * kib,
+        256 * kib,
+        |h| format!("build-script-build-{h:08x}.exe"),
+    )?;
+    file(&mut target, debug, "celeste-tools.exe", 486 * mib)?;
+    file(&mut target, debug, "celeste-tools.pdb", gib + 186 * mib)?;
+    file(&mut target, debug, "celeste_tools.d", 2 * mib + 96 * kib)?;
+    let release = dir(&mut target, 0, "release")?;
+    let release_deps = dir(&mut target, release, "deps")?;
+    pad(
+        &mut target,
+        release_deps,
+        146,
+        0x1656_67b1,
+        96 * kib,
+        8 * mib,
+        |h| format!("libceleste_tools-{h:08x}.rlib"),
+    )?;
+    file(
+        &mut target,
+        release,
+        "celeste-tools.exe",
+        38 * mib + 512 * kib,
+    )?;
+    file(&mut target, release, "celeste_tools.d", 2 * mib + 96 * kib)?;
+    file(&mut target, 0, ".rustc_info.json", 1236)?;
+    target.finish()?;
+
+    let mut venv = Snapshot::new(
+        r"D:\celeste-research\celeste-next-gym-ai\.venv".into(),
         d.clone(),
-        "example-metadata",
-        1,
+        "ntfs",
+        8,
     );
-    cache
-        .push(
-            0,
-            &"old-build.zip".encode_utf16().collect::<Vec<_>>(),
-            gib,
-            gib,
-            0,
-        )
-        .unwrap();
-    cache
-        .push(
-            0,
-            &"build.json".encode_utf16().collect::<Vec<_>>(),
-            2 * mib,
-            2 * mib,
-            0,
-        )
-        .unwrap();
-    cache.finish().unwrap();
-    let mut download = Snapshot::new(
-        r"C:\Downloads\archive.zip".into(),
+    let lib = dir(&mut venv, 0, "Lib")?;
+    let site = dir(&mut venv, lib, "site-packages")?;
+    pad(
+        &mut venv,
+        site,
+        18244,
+        0x2545_f491,
+        4 * kib,
+        512 * kib,
+        |h| format!("{h:08x}.cp312-win_amd64.pyd"),
+    )?;
+    let scripts = dir(&mut venv, 0, "Scripts")?;
+    pad(
+        &mut venv,
+        scripts,
+        46,
+        0x7f4a_7c15,
+        16 * kib,
+        6 * mib,
+        |h| format!("entry-{h:08x}.exe"),
+    )?;
+    file(&mut venv, 0, "pyvenv.cfg", 119)?;
+    venv.finish()?;
+
+    let mut archive = Snapshot::new(
+        r"C:\Users\mbcloud\Downloads\celeste-next-gym-ai-ckpt-2026-08.zip".into(),
         c.clone(),
-        "example-metadata",
-        1,
+        "ntfs",
+        8,
     );
-    download.nodes[0].flags = 0;
-    download.nodes[0].files = 1;
-    download.nodes[0].dirs = 0;
-    download.nodes[0].logical = 4 * gib;
-    download.nodes[0].allocated = 4 * gib;
-    download.finish().unwrap();
+    archive.nodes[0].flags = 0;
+    archive.nodes[0].files = 1;
+    archive.nodes[0].dirs = 0;
+    archive.nodes[0].logical = 4 * gib + 288 * mib;
+    archive.nodes[0].allocated = 4 * gib + 288 * mib;
+    archive.finish()?;
+
     let items = [
         (
-            build,
-            "可重建的 Rust 编译产物",
+            target,
+            "Rust 构建产物（cargo target）",
             vec![Alert {
                 level: Level::Warn,
-                text: "示例：不确定是否仍用于本地调试；用户已确认可重建".into(),
+                text: "可由源码重建；删除后首次编译需重编全部依赖（本机约 12 分钟）".into(),
             }],
         ),
         (
-            cache,
-            "过期的构建缓存",
+            venv,
+            "Python 虚拟环境（.venv）",
             vec![Alert {
                 level: Level::Critical,
-                text: "示例：无法核实其中是否含唯一产物，删除前请再确认一次".into(),
+                text: "无法核实其中是否含手工安装、未写入 requirements 的包；删除后无法恢复".into(),
             }],
         ),
-        (download, "已解压，确认不再需要", Vec::new()),
+        (archive, "已归档到 D 盘，确认不再需要", Vec::new()),
     ];
     let mut targets = Vec::new();
     let mut plan = Plan::default();
@@ -1086,24 +1415,53 @@ fn example_prepared() -> Prepared {
     }
     let total_items = targets.iter().map(|t| t.tree.nodes.len() as u64).sum();
     let allocated_upper_bound = targets.iter().map(|t| t.tree.nodes[0].allocated).sum();
-    Prepared {
-        plan_path: r"D:\example-plan.json".into(),
+    Ok(Prepared {
+        plan_path: r"D:\celeste-research\clean-targets.json".into(),
         plan,
         targets,
-        git: vec![GitAudit {
-            root: r"D:\Projects".into(),
-            risks: vec!["示例：未核实远端".into()],
-            ..GitAudit::default()
-        }],
+        git: vec![
+            GitAudit {
+                root: r"D:\celeste-research\MicroblocksQolUtils".into(),
+                branch: Some("main".into()),
+                modified: 2,
+                untracked: 3,
+                ignored: 1,
+                local_only_refs: vec!["tag:v3-vector-dataset".into()],
+                remotes: vec!["origin".into()],
+                risks: vec![
+                    "tracked changes/conflicts exist only locally".into(),
+                    "untracked worktree entries are not in Git".into(),
+                    "ignored entries are LOCAL-ONLY too; ignore does not mean disposable".into(),
+                    "remote refs are CACHED, not proof of current remote contents; run git --fetch to verify".into(),
+                ],
+                ..GitAudit::default()
+            },
+            GitAudit {
+                root: r"D:\celeste-research\celeste-next-gym-ai".into(),
+                branch: Some("main".into()),
+                modified: 1,
+                untracked: 2,
+                ignored: 4,
+                stashes: 1,
+                local_only_refs: vec!["branch:experiment/vr-baseline".into()],
+                remotes: vec!["origin".into()],
+                risks: vec![
+                    "ignored entries are LOCAL-ONLY too; ignore does not mean disposable".into(),
+                    "local stashes are not protected by ordinary push".into(),
+                    "remote origin unavailable/unverified: connection timed out".into(),
+                ],
+                ..GitAudit::default()
+            },
+        ],
         problems: Vec::new(),
         volumes: vec![d, c],
         total_items,
         allocated_upper_bound,
-    }
+    })
 }
 
 /// Render a read-only screenshot. No deletion or process-shutdown callbacks exist.
-pub fn preview(output: &Path, state_name: &str) -> Result<()> {
+pub fn preview(output: &Path, state_name: &str, dark: bool, compact: bool) -> Result<()> {
     use slint::platform::{
         Platform, WindowAdapter,
         software_renderer::{MinimalSoftwareWindow, RepaintBufferType},
@@ -1120,22 +1478,23 @@ pub fn preview(output: &Path, state_name: &str) -> Result<()> {
     slint::platform::set_platform(Box::new(Headless(window.clone())))
         .map_err(|e| anyhow::anyhow!("headless platform: {e}"))?;
     let ui = ReviewWindow::new()?;
+    if dark {
+        ui.invoke_preview_dark();
+    }
     let p = Arc::new(example_prepared());
     let trees = snapshots(&p);
     let forest = Forest::new(&trees)?;
     let mut choices: Vec<_> = trees.iter().map(|t| TreeSelection::all(t)).collect();
-    // One file intentionally unchecked: demonstrate parent/drive mixed states and
-    // selected-byte rollup with real values rather than fabricated row labels.
-    choices[0].set_subtree(trees[0], 3, false);
+    // The release profile stays behind on purpose: it produces half-checked ancestors
+    // and a "selected / total" rollup with the numbers a real review shows.
+    let release = trees[0].find(Path::new(
+        r"D:\celeste-research\MicroblocksQolUtils\target\release",
+    ))?;
+    choices[0].set_subtree(trees[0], release, false);
     let mut expanded = forest.initial_expansion();
     expanded.insert(forest.entry_key(0, 0).unwrap(), PAGE_SIZE);
-    expanded.insert(forest.entry_key(0, 1).unwrap(), PAGE_SIZE);
     let (tx, _) = mpsc::channel();
-    let selected = forest
-        .groups
-        .iter()
-        .position(|g| g.path == Path::new(r"D:\"))
-        .and_then(|i| forest.group_key(i).ok());
+    let selected = forest.entry_key(0, 0);
     let state = State {
         prepared: Some(p.clone()),
         choices,
@@ -1145,6 +1504,7 @@ pub fn preview(output: &Path, state_name: &str) -> Result<()> {
         pending_promotion: None,
         snapshot_identity: None,
         lock_response: None,
+        eta: None,
         cancel: Arc::new(AtomicBool::new(false)),
         snapshot: None,
         source: crate::deletion::IndexSource::Volume,
@@ -1154,34 +1514,225 @@ pub fn preview(output: &Path, state_name: &str) -> Result<()> {
     };
     ui.set_preview(true);
     ui.set_busy(false);
-    ui.set_plan_path("示例数据；不会读取或删除真实文件".into());
+    ui.set_plan_path(format!("计划：{}", p.plan_path.display()).into());
     refresh_selection(&ui, &state);
     show_selection(&ui, &state);
     if state_name == "notes-expanded" {
         ui.set_alerts_expanded(true);
     }
-    if state_name == "git" {
-        ui.set_modal_kind("git".into());
-        ui.set_modal_title("Git 数据需要第二次确认".into());
-        ui.set_modal_body("D:\\Projects\n\n分支 feature/local-work 含尚未同步的提交。\n另有 2 个未跟踪文件和 1 组 Git 忽略项。\n\n忽略项不代表可以删除。这里只处理树中已勾选的内容。\n\n此画面是示例，不会执行任何删除。".into());
+    match state_name {
+        "git" | "git-details" | "git-branch-long" => {
+            let mut examples = p.git.clone();
+            if state_name == "git-branch-long" {
+                examples[0].branch =
+                    Some("feature/vr-baseline-rework-with-vector-dataset-cache".into());
+            }
+            let audits: Vec<_> = examples.iter().collect();
+            Dialog::git(&audits).show(&ui);
+        }
+        "git-long" | "git-scrolled" => {
+            let mut audits = p.git.clone();
+            audits[0].modified = 38;
+            audits[0].untracked = 7;
+            audits[0].ignored = 30;
+            audits[0].risks.push(
+                "2 linked worktree(s); their private state is not covered by this report".into(),
+            );
+            audits[1].root =
+                r"D:\celeste-research\celeste-next-gym-ai\apps\desktop\packages\local-builds\unpublished-work"
+                    .into();
+            audits.push(crate::git_audit::GitAudit {
+                root: r"D:\celeste-research\celeste-agent\node_modules\.pnpm\generated".into(),
+                branch: Some("master".into()),
+                modified: 10,
+                untracked: 3,
+                ignored: 8,
+                remotes: vec!["origin".into()],
+                risks: vec!["remote origin unavailable/unverified: connection timed out".into()],
+                ..Default::default()
+            });
+            let refs: Vec<_> = audits.iter().collect();
+            Dialog::git(&refs).show(&ui);
+        }
+        "lock" | "lock-details" | "lock-owner-long" | "lock-long" | "lock-scrolled"
+        | "lock-unknown" | "lock-critical" | "lock-path-long" => {
+            let owners = if state_name == "lock"
+                || state_name == "lock-details"
+                || state_name == "lock-owner-long"
+            {
+                vec![crate::locks::Owner {
+                    pid: 21472,
+                    name: if state_name == "lock-owner-long" {
+                        "Microsoft Visual Studio Code — Insiders 扩展宿主、Renderer、Pylance 与远程隧道"
+                            .into()
+                    } else {
+                        "python.exe".into()
+                    },
+                    service: String::new(),
+                    critical: false,
+                    restartable: true,
+                    started: 0,
+                }]
+            } else if state_name == "lock-unknown" {
+                Vec::new()
+            } else if state_name == "lock-critical" {
+                vec![crate::locks::Owner {
+                    pid: 3960,
+                    name: "Antimalware Service Executable".into(),
+                    service: "WinDefend".into(),
+                    critical: true,
+                    restartable: false,
+                    started: 0,
+                }]
+            } else {
+                [
+                    ("python.exe", 21472),
+                    ("Code.exe", 38764),
+                    ("jupyter-lab.exe", 21480),
+                    ("explorer.exe", 4112),
+                    ("msedgewebview2.exe", 19004),
+                    ("Everything.exe", 9236),
+                    ("SearchIndexer.exe", 6288),
+                    ("Docker Desktop.exe", 15840),
+                    ("WindowsTerminal.exe", 26712),
+                    ("rclone.exe", 31044),
+                    ("notepad++.exe", 17220),
+                    ("TotalCMD64.exe", 40412),
+                ]
+                .iter()
+                .map(|(name, pid)| crate::locks::Owner {
+                    pid: *pid,
+                    name: (*name).into(),
+                    service: String::new(),
+                    critical: false,
+                    restartable: false,
+                    started: 0,
+                })
+                .collect()
+            };
+            let path = if state_name == "lock-path-long" {
+                r"D:\celeste-research\celeste-next-gym-ai\.venv\Lib\site-packages\torch\lib\cuda-precompiled-2026.08.14-windows-x64\torch_cuda.dll"
+            } else {
+                r"D:\celeste-research\celeste-next-gym-ai\.venv\Lib\site-packages\torch\lib\torch_cuda.dll"
+            };
+            Dialog::locked(
+                path,
+                &owners,
+                "无法打开删除句柄：另一个进程正在使用此文件。(os error 32, ERROR_SHARING_VIOLATION)",
+            )
+            .show(&ui);
+        }
+        "promote" => {
+            Dialog::promotion(Path::new(r"D:\celeste-research\celeste-next-gym-ai"), 1).show(&ui)
+        }
+        "error" | "error-scrolled" => {
+            let errors: Vec<_> = (0..15)
+                .map(|i| match i % 3 {
+                    0 => format!(
+                        r"D:\celeste-research\celeste-next-gym-ai\.venv\Lib\site-packages\torch\lib\torch_cuda-{i}.dll: file modification time changed after review; refresh required"
+                    ),
+                    1 => format!(
+                        r"D:\celeste-research\celeste-next-gym-ai\.venv\Lib\site-packages\nvidia\cublas\lib\cublasLt64-{i}.dll: skipped occupied item"
+                    ),
+                    _ => format!(
+                        r"D:\celeste-research\MicroblocksQolUtils\target\debug\deps\libceleste_tools-{i:08x}.rlib: file size changed after review; refresh required"
+                    ),
+                })
+                .collect();
+            Dialog::error(
+                "部分项目未删除",
+                "已删除 3412 项，失败 15 项。失败项目仍保留在标记中。",
+                &errors,
+                "已完成的删除无法撤销。",
+            )
+            .show(&ui);
+        }
+        "error-single" => Dialog::error(
+            "不能开始删除",
+            "安全校验未通过。请检查标记和 Git 风险。",
+            &[
+                r"D:\celeste-research\MicroblocksQolUtils\target: plan changed while window was open; refresh and confirm again"
+                    .into(),
+            ],
+            "没有开始删除。",
+        )
+        .show(&ui),
+        "about" => Dialog::about().show(&ui),
+        "progress" => {
+            ui.set_deleting(true);
+            ui.set_busy(true);
+            ui.set_progress(0.68);
+            ui.set_status(
+                r"D:\celeste-research\celeste-next-gym-ai\.venv\Lib\site-packages\torch\lib\torch_cuda.dll"
+                    .into(),
+            );
+            ui.set_progress_label("3516/5142 · 已删 3512 · 失败 4".into());
+            ui.set_eta_label("1m 25s".into());
+        }
+        "result" => {
+            let mut after = p.volumes.clone();
+            for volume in &mut after {
+                let freed: u64 = p
+                    .targets
+                    .iter()
+                    .zip(&state.choices)
+                    .filter(|(t, _)| t.tree.volume.serial == volume.serial)
+                    .map(|(_, s)| s.totals(0).allocated)
+                    .sum();
+                volume.free_bytes = (volume.free_bytes + freed).min(volume.total_bytes);
+            }
+            let removed_bytes = after
+                .iter()
+                .zip(&p.volumes)
+                .map(|(a, b)| a.free_bytes - b.free_bytes)
+                .sum();
+            let outcome = Outcome {
+                processed: 30_101,
+                removed: 30_099,
+                failed: 2,
+                removed_bytes,
+                cancelled: false,
+                errors: vec![
+                    r"D:\celeste-research\celeste-next-gym-ai\.venv\Lib\site-packages\nvidia\cublas\lib\cublasLt64-3.dll: skipped occupied item".into(),
+                    r"D:\celeste-research\MicroblocksQolUtils\target\debug\deps\libceleste_tools-0000062b.rlib: file size changed after review; refresh required".into(),
+                ],
+                before: p.volumes.clone(),
+                after,
+            };
+            ui.set_finished(true);
+            ui.set_busy(false);
+            ui.set_deleting(false);
+            ui.set_can_delete(false);
+            ui.set_reviewed(false);
+            ui.set_progress(1.0);
+            ui.set_status("操作结束。未成功删除的目标仍保留在标记列表中。".into());
+            ui.set_progress_label(
+                format!("已删除 {} · 失败 {}", outcome.removed, outcome.failed).into(),
+            );
+            ui.set_spaces(ModelRc::new(VecModel::from(space_rows(
+                &p,
+                &state.choices,
+                Some(&outcome),
+            ))));
+        }
+        _ => {}
     }
-    if state_name == "lock" {
-        ui.set_modal_kind("lock".into());
-        ui.set_modal_title("文件正在使用，需要你的决定".into());
-        ui.set_modal_body("目标：D:\\Cache\\build-history\\build.log\n\n占用程序：Example Editor (PID 4242)\n\n请先保存工作。只有你明确同意后才会请求应用关闭。\n\n此画面是示例，不会关闭进程。".into());
-        ui.set_can_close_owners(true);
-    }
-    if state_name == "progress" {
-        ui.set_deleting(true);
-        ui.set_busy(true);
-        ui.set_progress(0.64);
-        ui.set_status(r"D:\Cache\build-history\build.json".into());
-        ui.set_progress_label("7 / 11 · 示例进度".into());
-    }
-    let size = slint::PhysicalSize::new(1040, 790);
+    let size = if compact {
+        slint::PhysicalSize::new(900, 560)
+    } else {
+        slint::PhysicalSize::new(1180, 890)
+    };
     window.set_size(size);
     ui.show()?;
     slint::platform::update_timers_and_animations();
+    if state_name.ends_with("-details") {
+        ui.set_modal_details_expanded(true);
+        slint::platform::update_timers_and_animations();
+    }
+    if state_name.ends_with("-scrolled") {
+        ui.invoke_preview_scroll_end();
+        slint::platform::update_timers_and_animations();
+    }
     let mut buffer = vec![slint::Rgb8Pixel::default(); (size.width * size.height) as usize];
     window.draw_if_needed(|renderer| {
         renderer.render(&mut buffer, size.width as usize);

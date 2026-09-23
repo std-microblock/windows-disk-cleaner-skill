@@ -1,7 +1,9 @@
-import { Button, CheckBox, ListView, ScrollView, ProgressIndicator, LineEdit, Palette, AboutSlint } from "std-widgets.slint";
+import { Button, CheckBox, ListView, ScrollView, ProgressIndicator, LineEdit, Palette } from "std-widgets.slint";
 
 export struct TreeRow { key: int, depth: int, name: string, size: string, files: string, check-state: int, reason: string, directory: bool, group: bool, expandable: bool, expanded: bool, more: bool, warning: bool, git: bool, icon: string, severity: int, alert: string }
 export struct SpaceRow { drive: string, before: string, after: string, result: string, before-ratio: float, after-ratio: float }
+// A dialog is data, not an assembled paragraph. Each row can wrap independently.
+export struct DialogRow { kind: string, label: string, value: string, path: string, severity: int }
 
 
 // Slint's built-in Fluent CheckBox has two states. This small tree-only control
@@ -52,8 +54,55 @@ component FileGlyph inherits Image {
     accessible-role: none;
 }
 
+// One structured item; the section, owner and fact variants share Fluent spacing.
+component DialogItem inherits Rectangle {
+    in property <DialogRow> entry;
+    width: 100%;
+    height: item-layout.preferred-height + (entry.kind == "repo" ? 18px : entry.kind == "issue" ? 16px : 8px);
+    vertical-stretch: 0;
+    border-radius: 6px;
+    background: entry.kind == "repo" ? Palette.foreground.with-alpha(0.055) : transparent;
+    item-layout := VerticalLayout {
+        x: entry.kind == "repo" ? 12px : 0px;
+        y: entry.kind == "repo" ? 9px : 4px;
+        width: parent.width - (entry.kind == "repo" ? 24px : 0px);
+        spacing: 3px;
+        if entry.kind == "repo" : Rectangle {
+            height: max(20px, repo-label.preferred-height);
+            Image { x: 0; y: 2px; source: @image-url("icons/fluent/git.svg"); width: 16px; height: 16px; colorize: Palette.accent-background; }
+            repo-label := Text { x: 24px; width: parent.width - 116px; height: self.preferred-height; text: entry.label; wrap: word-wrap; font-weight: 600; font-size: 13px; color: Palette.foreground; }
+            Text { x: parent.width - 84px; width: 84px; y: 2px; text: entry.value; font-size: 11px; color: Palette.foreground.with-alpha(0.6); horizontal-alignment: right; }
+        }
+        if entry.kind == "repo" : Text { text: entry.path; wrap: word-wrap; font-size: 12px; color: Palette.foreground.with-alpha(0.67); }
+        if entry.kind == "fact" : HorizontalLayout { spacing: 14px;
+            Text { text: entry.label; width: 98px; font-size: 12px; color: Palette.foreground.with-alpha(0.62); }
+            Text { text: entry.value; wrap: word-wrap; font-size: 12px; color: Palette.foreground; horizontal-stretch: 1; }
+        }
+        if entry.kind == "caption" : HorizontalLayout { height: 18px;
+            Text { text: entry.label; font-size: 12px; font-weight: 600; color: Palette.foreground; }
+            Text { text: entry.value; font-size: 11px; color: Palette.foreground.with-alpha(0.58); horizontal-alignment: right; }
+        }
+        if entry.kind == "owner" : Rectangle {
+            height: max(20px, owner-label.preferred-height);
+            Rectangle { x: 0; y: 6px; width: 7px; height: 7px; border-radius: 4px; background: entry.severity > 0 ? #eaa300 : Palette.accent-background; }
+            owner-label := Text { x: 16px; width: parent.width - 136px; height: self.preferred-height; text: entry.label; wrap: word-wrap; font-size: 13px; color: Palette.foreground; }
+            Text { x: parent.width - 112px; width: 112px; y: 2px; text: entry.value; font-size: 11px; color: Palette.foreground.with-alpha(0.62); horizontal-alignment: right; }
+        }
+        if entry.kind == "note" : Text { text: entry.label; font-size: 13px; font-weight: 600; color: Palette.foreground; }
+        if entry.kind == "note" : Text { text: entry.value; font-size: 12px; wrap: word-wrap; color: Palette.foreground.with-alpha(0.72); }
+        if entry.kind == "issue" : HorizontalLayout { spacing: 10px;
+            Text { text: entry.label; width: 24px; font-size: 11px; color: Palette.foreground.with-alpha(0.48); }
+            VerticalLayout { spacing: 3px;
+                if entry.path != "" : Text { text: entry.path; wrap: word-wrap; font-size: 12px; color: Palette.foreground; }
+                Text { text: entry.value; wrap: word-wrap; font-size: 12px; color: Palette.foreground.with-alpha(0.72); }
+            }
+        }
+    }
+}
+
 export component ReviewWindow inherits Window {
     title: "Disk Cleaner — 删除确认";
+    icon: @image-url("../docs/icon.svg");
     preferred-width: 1180px; preferred-height: 760px;
     min-width: 900px; min-height: 560px;
     background: Palette.background;
@@ -71,6 +120,7 @@ export component ReviewWindow inherits Window {
     in property <string> plan-path;
     in property <string> status: "读取标记列表…";
     in property <string> progress-label: "尚未删除任何文件";
+    in property <string> eta-label: "";
     in property <float> progress: 0;
     in property <bool> busy: true;
     in property <bool> deleting: false;
@@ -90,7 +140,13 @@ export component ReviewWindow inherits Window {
     in property <bool> can-unmark: false;
     in-out property <string> modal-kind: "";
     in property <string> modal-title;
-    in property <string> modal-body;
+    in property <[DialogRow]> modal-items;
+    in-out property <length> modal-scroll-y: 0px;
+    in property <string> modal-summary;
+    in property <string> modal-path;
+    in property <string> modal-warning;
+    in property <string> modal-technical;
+    in-out property <bool> modal-details-expanded: false;
     in property <bool> can-close-owners: false;
     in-out property <bool> force-close: false;
     callback toggle-row(int, bool);
@@ -105,13 +161,18 @@ export component ReviewWindow inherits Window {
     callback confirm-git;
     callback cancel-work;
     callback lock-choice(int);
+    callback show-about;
+    callback preview-dark;
+    preview-dark => { Palette.color-scheme = ColorScheme.dark; }
+    callback preview-scroll-end;
+    preview-scroll-end => { root.modal-scroll-y = min(0px, details-scroll.visible-height - details-scroll.content-height); }
 
     VerticalLayout { padding: 20px; spacing: 12px;
         HorizontalLayout { height: 28px; spacing: 12px;
             Image { width: 20px; height: 20px; y: (parent.height - self.height) / 2; source: @image-url("icons/fluent/delete.svg"); colorize: Palette.foreground.with-alpha(0.8); }
             Text { text: root.finished ? "清理结果" : "待删除项目"; font-size: 20px; font-weight: 600; color: Palette.foreground; vertical-alignment: center; }
             Text { text: root.preview ? "示例预览 · 不会执行删除" : root.deleting ? "正在删除…" : root.finished ? "操作已结束" : "仅标记，尚未删除"; color: Palette.foreground.with-alpha(0.6); horizontal-alignment: right; vertical-alignment: center; font-size: 12px; horizontal-stretch: 1; }
-            Button { text: "关于"; width: 50px; height: 26px; clicked => { root.modal-kind = "about"; } }
+            Button { text: "关于"; width: 50px; height: 26px; enabled: !root.busy && root.modal-kind == ""; clicked => { root.show-about(); } }
         }
         HorizontalLayout { height: 32px; spacing: 8px;
             Button { text: "刷新"; icon: @image-url("icons/fluent/refresh.svg"); icon-size: 16px; colorize-icon: true; enabled: !root.busy; clicked => { if !root.preview { root.refresh(false); } } }
@@ -231,7 +292,7 @@ export component ReviewWindow inherits Window {
         if root.busy || root.finished : VerticalLayout { spacing: 7px; vertical-stretch: 0;
             HorizontalLayout { spacing: 12px;
                 Text { text: root.status; color: Palette.foreground.with-alpha(0.65); overflow: elide; font-size: 11px; }
-                Text { text: root.progress-label; color: Palette.foreground.with-alpha(0.65); horizontal-alignment: right; font-size: 11px; }
+                Text { text: root.progress-label + (root.deleting && root.eta-label != "" ? " · " + root.eta-label : ""); color: Palette.foreground.with-alpha(0.65); horizontal-alignment: right; font-size: 11px; }
             }
             ProgressIndicator { progress: root.progress; indeterminate: root.busy && !root.deleting; height: 3px; }
         }
@@ -244,28 +305,83 @@ export component ReviewWindow inherits Window {
         }
     }
 
-    if root.modal-kind != "" : Rectangle {
-        background: #00000044;
+    // Fluent-style content dialog: only the body scrolls, while the decision remains visible.
+    dialog-overlay := Rectangle {
+        visible: root.modal-kind != "";
+        background: #00000070;
         TouchArea {}
-        Rectangle { width: 620px; height: 360px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; background: Palette.background; border-radius: 8px; border-width: 1px; border-color: Palette.foreground.with-alpha(0.12);
+        Rectangle {
+            width: min(root.modal-kind == "git" ? 610px : 560px, parent.width - 48px);
+            height: min(
+                root.modal-kind == "about" ? 252px :
+                root.modal-kind == "promote" ? 310px :
+                root.modal-kind == "error" ? (root.modal-items.length <= 1 ? 252px : 420px) :
+                root.modal-kind == "lock" ? (root.modal-items.length <= 1 ? 290px : root.modal-items.length <= 3 ? 340px : 430px) :
+                root.modal-kind == "git" ? (root.modal-items.length <= 6 ? 360px : 450px) : 360px,
+                parent.height - 48px
+            );
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Palette.color-scheme == ColorScheme.dark ? #2b2b2b : #ffffff;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Palette.foreground.with-alpha(0.11);
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 8px;
+            drop-shadow-color: #00000055;
+            clip: true;
             VerticalLayout { spacing: 0;
-                VerticalLayout { padding: 24px; spacing: 16px;
-                    Text { text: root.modal-kind == "about" ? "Disk Cleaner" : root.modal-title; font-size: 20px; font-weight: 600; color: Palette.foreground; }
-                    if root.modal-kind == "about" : AboutSlint {}
-                    if root.modal-kind != "about" : ScrollView { Text { text: root.modal-body; wrap: word-wrap; color: Palette.foreground.with-alpha(0.8); } }
-                    if root.modal-kind == "lock" : CheckBox { text: "允许强制关闭（可能丢失未保存的内容）"; checked <=> root.force-close; enabled: root.can-close-owners; }
+                VerticalLayout { padding-left: 24px; padding-right: 24px; padding-top: 22px; padding-bottom: 12px; spacing: 6px;
+                    Text { text: root.modal-title; font-size: 20px; font-weight: 600; color: Palette.foreground; }
+                    Text { text: root.modal-summary; font-size: 13px; wrap: word-wrap; color: Palette.foreground.with-alpha(0.72); }
                 }
-                Rectangle { height: 1px; background: Palette.foreground.with-alpha(0.08); }
-                Rectangle { height: 70px; background: Palette.alternate-background.with-alpha(0.5);
-                    HorizontalLayout { padding: 20px; spacing: 8px; alignment: end;
-                        if root.modal-kind == "promote" : Button { text: "取消"; clicked => { root.modal-kind = ""; } }
-                        if root.modal-kind == "promote" : Button { text: "扩大标记范围"; primary: true; clicked => { root.confirm-promotion(); } }
-                        if root.modal-kind == "git" : Button { text: "返回"; clicked => { root.modal-kind = ""; } }
-                        if root.modal-kind == "git" : Button { text: "仍然删除本地数据"; primary: true; clicked => { root.confirm-git(); } }
-                        if root.modal-kind == "lock" : Button { text: "跳过"; clicked => { root.lock-choice(0); } }
-                        if root.modal-kind == "lock" : Button { text: "重试"; clicked => { root.lock-choice(1); } }
-                        if root.modal-kind == "lock" : Button { text: root.force-close ? "强制关闭并继续" : "关闭应用并继续"; primary: true; enabled: root.can-close-owners; clicked => { root.lock-choice(root.force-close ? 3 : 2); } }
-                        if root.modal-kind == "error" || root.modal-kind == "about" : Button { text: "关闭"; clicked => { root.modal-kind = ""; } }
+                details-scroll := ScrollView {
+                    vertical-stretch: 1;
+                    content-y <=> root.modal-scroll-y;
+                    content-width: self.visible-width;
+                    horizontal-scrollbar-policy: always-off;
+                    VerticalLayout {
+                        x: 24px;
+                        width: details-scroll.visible-width - 56px;
+                        alignment: start;
+                        padding-top: 6px;
+                        padding-bottom: 16px;
+                        spacing: 6px;
+                        if root.modal-path != "" : VerticalLayout { spacing: 4px;
+                            Text { text: "目标"; font-size: 11px; color: Palette.foreground.with-alpha(0.56); }
+                            Text { text: root.modal-path; wrap: word-wrap; font-size: 12px; color: Palette.foreground; }
+                        }
+                        if root.modal-details-expanded && root.modal-technical != "" : Rectangle {
+                            height: technical-text.preferred-height + 20px;
+                            border-radius: 4px;
+                            background: Palette.foreground.with-alpha(0.05);
+                            technical-text := Text { x: 10px; y: 10px; width: parent.width - 20px; text: root.modal-technical; wrap: word-wrap; font-size: 11px; color: Palette.foreground.with-alpha(0.68); }
+                        }
+                        for entry in root.modal-items : DialogItem { entry: entry; }
+                        if root.modal-warning != "" : Text { text: root.modal-warning; wrap: word-wrap; font-size: 11px; color: Palette.foreground.with-alpha(0.63); }
+                    }
+                }
+                if root.modal-kind == "lock" && root.can-close-owners : Rectangle { height: 38px;
+                    CheckBox { x: 24px; y: 3px; text: "强制关闭（可能丢失未保存内容）"; checked <=> root.force-close; }
+                }
+                Rectangle { height: 1px; background: Palette.foreground.with-alpha(0.12); }
+                Rectangle { height: 60px; background: Palette.color-scheme == ColorScheme.dark ? #262626 : #f7f7f7;
+                    HorizontalLayout { x: 24px; y: 14px; width: parent.width - 48px; height: 32px; spacing: 8px;
+                        if root.modal-technical != "" : Rectangle { width: 76px; height: 32px;
+                            Text { text: root.modal-details-expanded ? "收起详情" : "技术详情"; font-size: 12px; color: Palette.accent-background; vertical-alignment: center; }
+                            TouchArea { mouse-cursor: pointer; accessible-role: button; accessible-label: root.modal-details-expanded ? "收起技术详情" : "查看技术详情";
+                                clicked => { root.modal-details-expanded = !root.modal-details-expanded; root.modal-scroll-y = 0px; }
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        if root.modal-kind == "promote" : Button { text: "标记整个目录"; height: 32px; clicked => { root.confirm-promotion(); } }
+                        if root.modal-kind == "promote" : Button { text: "保持现状"; height: 32px; primary: true; clicked => { root.modal-kind = ""; } }
+                        if root.modal-kind == "git" : Button { text: "仍要永久删除"; height: 32px; clicked => { root.confirm-git(); } }
+                        if root.modal-kind == "git" : Button { text: "返回检查"; height: 32px; primary: true; clicked => { root.modal-kind = ""; } }
+                        if root.modal-kind == "lock" && root.can-close-owners : Button { text: root.force-close ? "强制关闭并重试" : "关闭应用并重试"; height: 32px; clicked => { root.lock-choice(root.force-close ? 3 : 2); } }
+                        if root.modal-kind == "lock" : Button { text: "重试"; height: 32px; clicked => { root.lock-choice(1); } }
+                        if root.modal-kind == "lock" : Button { text: "跳过此项"; height: 32px; primary: true; clicked => { root.lock-choice(0); } }
+                        if root.modal-kind == "error" || root.modal-kind == "about" : Button { text: "关闭"; height: 32px; primary: true; clicked => { root.modal-kind = ""; } }
                     }
                 }
             }

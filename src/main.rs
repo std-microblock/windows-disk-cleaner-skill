@@ -49,8 +49,14 @@ enum Command {
     UiPreview {
         #[arg(long)]
         out: PathBuf,
-        #[arg(long,default_value="review",value_parser=["review","git","lock","progress","notes","notes-expanded"])]
+        #[arg(long,default_value="review",value_parser=["review","git","git-details","git-branch-long","git-long","git-scrolled","lock","lock-details","lock-owner-long","lock-long","lock-scrolled","lock-unknown","lock-critical","lock-path-long","promote","error","error-scrolled","error-single","about","progress","result","notes","notes-expanded"])]
         state: String,
+        /// Preview using Fluent's dark palette.
+        #[arg(long)]
+        dark: bool,
+        /// Verify dialogs at the minimum supported window size.
+        #[arg(long)]
+        compact: bool,
     },
     /// Scan a volume (fast) or subtree (fs); save the complete, lossless drill-down index.
     Scan(ScanArgs),
@@ -245,10 +251,15 @@ fn run(cli: Cli) -> Result<i32> {
                 println!("rm is STAGE ONLY. No headless/--yes/force-delete command exists.");
             }
         }
-        Command::UiPreview { out, state } => {
+        Command::UiPreview {
+            out,
+            state,
+            dark,
+            compact,
+        } => {
             #[cfg(feature = "gui")]
             {
-                disk_cleaner::gui::preview(&out, &state)?;
+                disk_cleaner::gui::preview(&out, &state, dark, compact)?;
                 println!(
                     "Read-only UI preview: {}",
                     platform::absolute(&out)?.display()
@@ -256,7 +267,7 @@ fn run(cli: Cli) -> Result<i32> {
             }
             #[cfg(not(feature = "gui"))]
             {
-                let _ = (out, state);
+                let _ = (out, state, dark, compact);
                 bail!("GUI feature is disabled");
             }
         }
