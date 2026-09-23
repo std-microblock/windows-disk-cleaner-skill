@@ -1,0 +1,6 @@
+/target/
+/dist/
+/.disk-cleaner/
+/clean-targets.json*
+*.dcscan
+*.dcscan.tmp

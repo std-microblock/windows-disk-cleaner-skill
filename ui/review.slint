@@ -1,0 +1,212 @@
+import { Button, CheckBox, ListView, ScrollView, ProgressIndicator, LineEdit, Palette, AboutSlint } from "std-widgets.slint";
+
+export struct TreeRow { key: int, depth: int, name: string, size: string, files: string, check-state: int, reason: string, directory: bool, expandable: bool, expanded: bool, more: bool, warning: bool, git: bool, icon: string }
+export struct SpaceRow { drive: string, before: string, after: string, before-ratio: float, after-ratio: float }
+
+
+// Slint's built-in Fluent CheckBox has two states. This small tree-only control
+// adds the standard mixed dash while keeping the Fluent 18px / 2px geometry.
+component TreeCheck inherits Rectangle {
+    in property <int> state;
+    in property <bool> enabled: true;
+    in property <string> label;
+    callback toggled(bool);
+    width: 18px; height: 18px;
+    border-radius: 2px;
+    background: root.state > 0 ? Palette.accent-background : Palette.foreground.with-alpha(touch.has-hover ? 0.06 : 0.025);
+    border-width: root.state > 0 ? 0px : 1px;
+    border-color: Palette.foreground.with-alpha(root.enabled ? 0.55 : 0.2);
+    opacity: root.enabled ? 1 : 0.5;
+    accessible-role: checkbox;
+    accessible-checkable: true;
+    accessible-checked: root.state == 2;
+    accessible-enabled: root.enabled;
+    accessible-label: root.label + (root.state == 1 ? "，部分选中" : "");
+    accessible-action-default => { if root.enabled { root.toggled(root.state != 2); } }
+    if root.state == 2 : Image { x: 3px; y: 3px; width: 12px; height: 12px; source: @image-url("icons/fluent/check.svg"); colorize: Palette.accent-foreground; }
+    if root.state == 1 : Rectangle { x: 4px; y: 8px; width: 10px; height: 2px; border-radius: 1px; background: Palette.accent-foreground; }
+    if focus.has-focus : Rectangle { x: -3px; y: -3px; width: 24px; height: 24px; border-radius: 4px; border-width: 1px; border-color: Palette.foreground; }
+    touch := TouchArea { enabled: root.enabled; clicked => { focus.focus(); root.toggled(root.state != 2); } }
+    focus := FocusScope { enabled: root.enabled; key-pressed(event) => { if event.text == Key.Space { root.toggled(root.state != 2); return accept; } return reject; } }
+}
+
+
+component FileGlyph inherits Image {
+    in property <string> kind;
+    in property <bool> open;
+    width: 18px; height: 18px;
+    source: kind == "drive" ? @image-url("icons/fluent/drive.svg") :
+        kind == "folder" ? (open ? @image-url("icons/fluent/folder-open.svg") : @image-url("icons/fluent/folder.svg")) :
+        kind == "archive" ? @image-url("icons/fluent/archive.svg") :
+        kind == "code" ? @image-url("icons/fluent/code.svg") :
+        kind == "settings" ? @image-url("icons/fluent/settings.svg") :
+        kind == "text" ? @image-url("icons/fluent/text.svg") :
+        kind == "image" ? @image-url("icons/fluent/image.svg") :
+        kind == "video" ? @image-url("icons/fluent/video.svg") :
+        kind == "audio" ? @image-url("icons/fluent/audio.svg") :
+        kind == "link" ? @image-url("icons/fluent/link.svg") :
+        kind == "add" ? @image-url("icons/fluent/add.svg") : @image-url("icons/fluent/file.svg");
+    colorize: kind == "folder" ? #be8b13 :
+        kind == "code" || kind == "image" || kind == "video" ? Palette.accent-background : Palette.foreground.with-alpha(0.72);
+    accessible-role: none;
+}
+
+export component ReviewWindow inherits Window {
+    title: "Disk Cleaner — 删除确认";
+    preferred-width: 960px; preferred-height: 640px;
+    min-width: 820px; min-height: 520px;
+    background: Palette.background;
+    default-font-family: "Segoe UI"; default-font-size: 13px;
+
+    in property <[TreeRow]> rows;
+    in property <[SpaceRow]> spaces;
+    in property <string> total-size: "—";
+    in property <string> target-count: "0";
+    in property <string> item-count: "正在准备…";
+    in property <string> git-title;
+    in property <string> git-detail;
+    in property <bool> git-risk: false;
+    in property <string> plan-path;
+    in property <string> status: "读取标记列表…";
+    in property <string> progress-label: "尚未删除任何文件";
+    in property <float> progress: 0;
+    in property <bool> busy: true;
+    in property <bool> deleting: false;
+    in property <bool> can-delete: false;
+    in property <bool> finished: false;
+    in property <bool> preview: false;
+    in-out property <bool> reviewed: false;
+    in property <int> selected-key: -1;
+    in property <string> selected-path: "选择项目查看完整路径";
+    in property <string> selected-reason;
+    in property <bool> can-unmark: false;
+    in-out property <string> modal-kind: "";
+    in property <string> modal-title;
+    in property <string> modal-body;
+    in property <bool> can-close-owners: false;
+    in-out property <bool> force-close: false;
+    callback toggle-row(int, bool);
+    callback check-row(int, bool);
+    callback check-all(bool);
+    callback select-row(int);
+    callback refresh(bool);
+    callback unmark-selected;
+    callback request-delete;
+    callback confirm-git;
+    callback cancel-work;
+    callback lock-choice(int);
+
+    VerticalLayout { padding: 20px; spacing: 12px;
+        HorizontalLayout { height: 28px; spacing: 12px;
+            Image { width: 20px; height: 20px; y: (parent.height - self.height) / 2; source: @image-url("icons/fluent/delete.svg"); colorize: Palette.foreground.with-alpha(0.8); }
+            Text { text: root.finished ? "清理结果" : "待删除项目"; font-size: 20px; font-weight: 600; color: Palette.foreground; vertical-alignment: center; }
+            Button { text: "关于"; clicked => { root.modal-kind = "about"; } }
+            Text { text: root.preview ? "示例预览 · 不会执行删除" : root.deleting ? "正在删除…" : root.finished ? "操作已结束" : "仅标记，尚未删除"; color: Palette.foreground.with-alpha(0.6); horizontal-alignment: right; vertical-alignment: center; font-size: 12px; }
+        }
+        HorizontalLayout { height: 32px; spacing: 8px;
+            Button { text: "刷新"; icon: @image-url("icons/fluent/refresh.svg"); icon-size: 16px; colorize-icon: true; enabled: !root.busy; clicked => { if !root.preview { root.refresh(false); } } }
+            Button { text: "核实 Git 远端"; icon: @image-url("icons/fluent/git.svg"); icon-size: 16px; colorize-icon: true; enabled: !root.busy; clicked => { if !root.preview { root.refresh(true); } } }
+            Button { text: "全选"; icon: @image-url("icons/fluent/select.svg"); icon-size: 16px; colorize-icon: true; enabled: !root.busy; clicked => { root.check-all(true); } }
+            Button { text: "全不选"; icon: @image-url("icons/fluent/deselect.svg"); icon-size: 16px; colorize-icon: true; enabled: !root.busy; clicked => { root.check-all(false); } }
+            Button { text: "取消标记"; icon: @image-url("icons/fluent/unmark.svg"); icon-size: 16px; colorize-icon: true; enabled: root.can-unmark && !root.busy; clicked => { if !root.preview { root.unmark-selected(); } } }
+            Rectangle { horizontal-stretch: 1; }
+            Text { text: root.item-count + " · " + root.total-size; color: Palette.foreground.with-alpha(0.72); vertical-alignment: center; }
+        }
+        Rectangle { vertical-stretch: 1; min-height: 160px; border-width: 1px; border-color: Palette.foreground.with-alpha(0.12); border-radius: 4px; background: Palette.control-background; clip: true;
+            VerticalLayout { padding: 1px; spacing: 0;
+                Rectangle { height: 34px; background: Palette.alternate-background.with-alpha(0.5);
+                    HorizontalLayout { padding-left: 88px; padding-right: 16px; spacing: 18px;
+                        Text { text: "名称"; color: Palette.foreground.with-alpha(0.65); vertical-alignment: center; }
+                        Text { text: "待删大小"; width: 100px; color: Palette.foreground.with-alpha(0.65); horizontal-alignment: right; vertical-alignment: center; }
+                        Text { text: "文件（已选 / 总数）"; width: 122px; color: Palette.foreground.with-alpha(0.65); horizontal-alignment: right; vertical-alignment: center; }
+                        Text { text: "原因 / 状态"; width: 160px; color: Palette.foreground.with-alpha(0.65); vertical-alignment: center; }
+                    }
+                }
+                tree := ListView { for item in root.rows : Rectangle { height: 34px; width: tree.visible-width;
+                    background: root.selected-key == item.key && !item.more ? Palette.foreground.with-alpha(0.055) : row-touch.has-hover ? Palette.foreground.with-alpha(0.035) : transparent;
+                    border-radius: 4px;
+                    accessible-role: list-item;
+                    accessible-label: item.name + ", " + item.size + ", " + item.reason;
+                    accessible-item-selectable: true;
+                    accessible-item-selected: root.selected-key == item.key && !item.more;
+                    accessible-action-default => { if item.more { root.toggle-row(item.key, true); } else { root.select-row(item.key); } }
+                    if root.selected-key == item.key && !item.more : Rectangle { x: 0; y: 9px; width: 3px; height: 16px; border-radius: 2px; background: Palette.accent-background; }
+                    row-touch := TouchArea { clicked => { if item.more { root.toggle-row(item.key, true); } else { root.select-row(item.key); } } }
+                    HorizontalLayout { padding-left: 10px + item.depth * 16px; padding-right: 16px; spacing: 18px;
+                        HorizontalLayout { spacing: 6px;
+                            Rectangle { width: 18px;
+                                if item.expandable || item.more : Image { width: 12px; height: 12px; x: 3px; y: (parent.height - self.height) / 2; source: item.more ? @image-url("icons/fluent/add.svg") : item.expanded ? @image-url("icons/fluent/chevron-down.svg") : @image-url("icons/fluent/chevron-right.svg"); colorize: Palette.foreground.with-alpha(0.7); }
+                                TouchArea { enabled: item.expandable || item.more; clicked => { root.toggle-row(item.key, item.more); } }
+                            }
+                            Rectangle { width: 24px;
+                                if !item.more : TreeCheck { x: 0; y: (parent.height - self.height) / 2; state: item.check-state; enabled: !root.busy && !root.finished && root.modal-kind == ""; label: item.name; toggled(checked) => { root.check-row(item.key, checked); } }
+                            }
+                            FileGlyph { kind: item.icon; open: item.expanded; y: (parent.height - self.height) / 2; }
+                            Text { text: item.name; color: item.more ? Palette.accent-background : Palette.foreground; overflow: elide; vertical-alignment: center; }
+                        }
+                        Text { text: item.size; width: 100px; horizontal-alignment: right; vertical-alignment: center; color: Palette.foreground.with-alpha(0.8); }
+                        Text { text: item.files; width: 122px; horizontal-alignment: right; vertical-alignment: center; color: Palette.foreground.with-alpha(0.7); }
+                        HorizontalLayout { width: 160px; spacing: 5px;
+                            if item.git : Image { width: 14px; height: 14px; y: (parent.height - self.height) / 2; source: @image-url("icons/fluent/git.svg"); colorize: Palette.foreground.with-alpha(0.65); }
+                            if item.warning : Image { width: 14px; height: 14px; y: (parent.height - self.height) / 2; source: @image-url("icons/fluent/warning.svg"); colorize: #a55f13; }
+                            Text { text: item.reason; color: Palette.foreground.with-alpha(item.warning ? 0.85 : 0.6); overflow: elide; vertical-alignment: center; }
+                        }
+                    }
+                } }
+                if root.rows.length == 0 : Text { text: root.busy ? "正在读取文件清单…" : "没有待删除项目"; color: Palette.foreground.with-alpha(0.55); horizontal-alignment: center; height: 56px; }
+            }
+        }
+        VerticalLayout { spacing: 5px; vertical-stretch: 0;
+            LineEdit { text: root.selected-path; read-only: true; }
+            Text { text: root.selected-reason; font-size: 11px; color: Palette.foreground.with-alpha(0.6); overflow: elide; }
+        }
+        VerticalLayout { spacing: 4px; vertical-stretch: 0;
+            for space in root.spaces : HorizontalLayout { height: 19px; spacing: 12px;
+                Text { text: space.drive; width: 32px; color: Palette.foreground.with-alpha(0.7); }
+                Text { text: space.before + "  →  " + space.after; color: Palette.foreground.with-alpha(0.7); font-size: 12px; }
+                Text { text: ""; horizontal-stretch: 1; }
+            }
+            Text { text: "实际释放可能较少（硬链接 / 共享块）。"; color: Palette.foreground.with-alpha(0.5); font-size: 11px; }
+        }
+        if root.busy || root.finished : VerticalLayout { spacing: 7px; vertical-stretch: 0;
+            HorizontalLayout { spacing: 12px;
+                Text { text: root.status; color: Palette.foreground.with-alpha(0.65); overflow: elide; font-size: 11px; }
+                Text { text: root.progress-label; color: Palette.foreground.with-alpha(0.65); horizontal-alignment: right; font-size: 11px; }
+            }
+            ProgressIndicator { progress: root.progress; indeterminate: root.busy && !root.deleting; height: 3px; }
+        }
+        Rectangle { height: 1px; background: Palette.foreground.with-alpha(0.08); }
+        HorizontalLayout { height: 34px; spacing: 8px;
+            CheckBox { text: "永久删除，不放入回收站"; checked <=> root.reviewed; enabled: !root.busy && !root.finished; }
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: root.busy ? "停止" : "关闭"; clicked => { root.cancel-work(); } }
+            Button { text: "确认删除"; icon: @image-url("icons/fluent/delete.svg"); icon-size: 16px; colorize-icon: true; primary: true; enabled: root.can-delete && root.reviewed && !root.busy && !root.finished && !root.preview; clicked => { root.request-delete(); } }
+        }
+    }
+
+    if root.modal-kind != "" : Rectangle {
+        background: #00000044;
+        TouchArea {}
+        Rectangle { width: 620px; height: 360px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; background: Palette.background; border-radius: 8px; border-width: 1px; border-color: Palette.foreground.with-alpha(0.12);
+            VerticalLayout { spacing: 0;
+                VerticalLayout { padding: 24px; spacing: 16px;
+                    Text { text: root.modal-kind == "about" ? "Disk Cleaner" : root.modal-title; font-size: 20px; font-weight: 600; color: Palette.foreground; }
+                    if root.modal-kind == "about" : AboutSlint {}
+                    if root.modal-kind != "about" : ScrollView { Text { text: root.modal-body; wrap: word-wrap; color: Palette.foreground.with-alpha(0.8); } }
+                    if root.modal-kind == "lock" : CheckBox { text: "允许强制关闭（可能丢失未保存的内容）"; checked <=> root.force-close; enabled: root.can-close-owners; }
+                }
+                Rectangle { height: 1px; background: Palette.foreground.with-alpha(0.08); }
+                Rectangle { height: 70px; background: Palette.alternate-background.with-alpha(0.5);
+                    HorizontalLayout { padding: 20px; spacing: 8px; alignment: end;
+                        if root.modal-kind == "git" : Button { text: "返回"; clicked => { root.modal-kind = ""; } }
+                        if root.modal-kind == "git" : Button { text: "仍然删除本地数据"; primary: true; clicked => { root.confirm-git(); } }
+                        if root.modal-kind == "lock" : Button { text: "跳过"; clicked => { root.lock-choice(0); } }
+                        if root.modal-kind == "lock" : Button { text: "重试"; clicked => { root.lock-choice(1); } }
+                        if root.modal-kind == "lock" : Button { text: root.force-close ? "强制关闭并继续" : "关闭应用并继续"; primary: true; enabled: root.can-close-owners; clicked => { root.lock-choice(root.force-close ? 3 : 2); } }
+                        if root.modal-kind == "error" || root.modal-kind == "about" : Button { text: "关闭"; clicked => { root.modal-kind = ""; } }
+                    }
+                }
+            }
+        }
+    }
+}

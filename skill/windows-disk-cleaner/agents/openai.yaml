@@ -1,0 +1,4 @@
+interface:
+  display_name: "Windows 磁盘清理"
+  short_description: "快速扫描 NTFS / ReFS，核查 Git 风险，只标记清理目标并交由用户确认"
+  default_prompt: "使用 $windows-disk-cleaner 分析磁盘占用，核查候选目录的 Git 风险，只标记清理目标并让我在窗口中确认。"
