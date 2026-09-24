@@ -655,13 +655,12 @@ fn scan_via_file_records(
     let mut parents = Vec::new();
     let mut dirs = AHashMap::new();
     for index in 0..total {
-        match raw.file_record(index, record_size) {
-            Ok(mut bytes) => match parse_record(&mut bytes, index, data.BytesPerSector as usize) {
+        if let Ok(mut bytes) = raw.file_record(index, record_size) {
+            match parse_record(&mut bytes, index, data.BytesPerSector as usize) {
                 Ok(Some(record)) => add_record(record, &mut s, &mut parents, &mut dirs)?,
                 Ok(None) => {}
                 Err(error) => s.warn(error.to_string()),
-            },
-            Err(_) => {}
+            }
         }
         if s.index_bytes() > memory_limit {
             bail!("MFT index memory budget exceeded; use --max-memory-mib");

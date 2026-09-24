@@ -571,7 +571,7 @@ impl RawReader {
                     result = Err(error).context("ReadFile raw volume");
                 } else {
                     WaitForSingleObject(event, INFINITE);
-                    if GetOverlappedResult(f.as_raw_handle(), &mut ov, &mut got, 1) == 0 {
+                    if GetOverlappedResult(f.as_raw_handle(), &ov, &mut got, 1) == 0 {
                         result = Err(std::io::Error::last_os_error())
                             .context("GetOverlappedResult raw volume");
                     }
