@@ -236,7 +236,10 @@ fn output_json(value: &impl serde::Serialize) -> Result<()> {
 }
 fn run(cli: Cli) -> Result<i32> {
     #[cfg(windows)]
-    if cli.elevate && cli.elevation_stdout.is_none() && !platform::elevation::is_elevated() {
+    if cli.elevate
+        && cli.elevation_stdout.is_none()
+        && (!platform::elevation::is_elevated() || platform::elevation::relaunch_forced())
+    {
         return platform::elevation::relaunch_elevated();
     }
     #[cfg(not(windows))]

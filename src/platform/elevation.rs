@@ -72,6 +72,20 @@ pub fn require_administrator() -> Result<()> {
     Ok(())
 }
 
+/// True when --elevate must relaunch even though this process already holds
+/// administrator rights. Only the test verb below does that, so a CI runner that
+/// is elevated to begin with still exercises the launch and relay path.
+pub fn relaunch_forced() -> bool {
+    #[cfg(windows)]
+    {
+        win::test_verb().is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Caller side of --elevate: one UAC consent prompt, a live output relay, and the
 /// elevated child's exit code. Blocks until the child exits.
 pub fn relaunch_elevated() -> Result<i32> {
@@ -289,15 +303,19 @@ mod win {
         Ok(())
     }
 
-    /// The verb used to relaunch. Production always asks Windows for consent;
-    /// CI and local verification can exercise the identical launch and relay path
-    /// without a prompt by setting DISK_CLEANER_ELEVATION_VERB=open, in which case
-    /// the child keeps the caller's own token.
-    fn elevation_verb() -> Vec<u16> {
+    /// DISK_CLEANER_ELEVATION_VERB=open is the only recognised test verb: it
+    /// replaces the consent prompt with a plain launch, so CI and local
+    /// verification exercise the identical launch and relay path without UAC.
+    pub(super) fn test_verb() -> Option<&'static str> {
         match std::env::var("DISK_CLEANER_ELEVATION_VERB").as_deref() {
-            Ok("open") => wide("open"),
-            _ => wide("runas"),
+            Ok("open") => Some("open"),
+            _ => None,
         }
+    }
+    /// The verb used to relaunch: consent prompt in production, the test verb in
+    /// verification.
+    fn elevation_verb() -> Vec<u16> {
+        wide(test_verb().unwrap_or("runas"))
     }
 
     /// One of the caller's own streams, with just enough state to keep a split

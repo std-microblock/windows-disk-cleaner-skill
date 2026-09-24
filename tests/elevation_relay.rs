@@ -57,9 +57,13 @@ fn elevated_child_reports_through_the_relay() {
     // Progress and warnings belong to stderr: an agent parses stdout.
     assert!(stderr.contains("请求管理员权限"), "stderr: {stderr}");
     assert!(!stdout.contains("请求管理员权限"), "stdout: {stdout}");
-    // Without a consent prompt the child keeps the caller's token and says so.
-    assert!(stderr.contains("没有拿到管理员权限"), "stderr: {stderr}");
-    assert_eq!(value["administrator"].as_bool(), Some(false));
+    // Without a consent prompt the child keeps whatever token the caller has, so
+    // an unelevated runner gets the warning and an elevated runner (CI) does not.
+    match value["administrator"].as_bool() {
+        Some(false) => assert!(stderr.contains("没有拿到管理员权限"), "stderr: {stderr}"),
+        Some(true) => assert!(!stderr.contains("没有拿到管理员权限"), "stderr: {stderr}"),
+        other => panic!("administrator is not a boolean: {other:?}"),
+    }
     let _ = std::fs::remove_dir_all(&cwd);
 }
 
