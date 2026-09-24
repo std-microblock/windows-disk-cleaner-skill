@@ -31,7 +31,7 @@ slint = { version = "=1.18.1", optional = true, default-features = false, featur
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Threading", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_RestartManager", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Environment", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Threading", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_RestartManager", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 slint-build = { version = "=1.18.1", optional = true }

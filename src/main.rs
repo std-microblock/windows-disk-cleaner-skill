@@ -33,10 +33,35 @@ struct Cli {
         help = "Relaunch this command through one Windows UAC prompt (needed for raw NTFS/ReFS scans); never implicit"
     )]
     elevate: bool,
+    #[arg(long, global = true, hide = true, value_name = "PIPE")]
+    elevation_stdout: Option<OsString>,
+    #[arg(long, global = true, hide = true, value_name = "PIPE")]
+    elevation_stderr: Option<OsString>,
     #[arg(long, global = true, hide = true, value_name = "DIR")]
-    elevation_report: Option<PathBuf>,
+    elevation_cwd: Option<PathBuf>,
+    #[arg(long, global = true, hide = true, value_name = "PID")]
+    elevation_parent: Option<u32>,
+    #[arg(long, global = true, hide = true, value_name = "DIR")]
+    elevation_fallback: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
+}
+impl Cli {
+    /// The relay this process was started with, when it is the elevated child of
+    /// an --elevate call. Both pipes are required together.
+    fn relay(&self) -> Result<Option<platform::elevation::RelaySpec>> {
+        match (&self.elevation_stdout, &self.elevation_stderr) {
+            (None, None) => Ok(None),
+            (Some(stdout), Some(stderr)) => Ok(Some(platform::elevation::RelaySpec {
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                cwd: self.elevation_cwd.clone(),
+                parent: self.elevation_parent,
+                fallback: self.elevation_fallback.clone(),
+            })),
+            _ => anyhow::bail!("--elevation-stdout and --elevation-stderr must be passed together"),
+        }
+    }
 }
 #[derive(Subcommand)]
 enum Command {
@@ -211,7 +236,7 @@ fn output_json(value: &impl serde::Serialize) -> Result<()> {
 }
 fn run(cli: Cli) -> Result<i32> {
     #[cfg(windows)]
-    if cli.elevate && cli.elevation_report.is_none() && !platform::elevation::is_elevated() {
+    if cli.elevate && cli.elevation_stdout.is_none() && !platform::elevation::is_elevated() {
         return platform::elevation::relaunch_elevated();
     }
     #[cfg(not(windows))]
@@ -520,10 +545,12 @@ fn main() {
         }
     });
     let cli = Cli::parse_from(args);
-    // Elevated child: report through files, since it may own no console at all.
-    if let Some(report) = cli.elevation_report.clone()
-        && let Err(e) = platform::elevation::redirect_output(&report)
-    {
+    // Elevated child: stream this process' output back through the caller.
+    let relay = cli.relay().and_then(|relay| match relay {
+        Some(relay) => platform::elevation::attach_relay(&relay),
+        None => Ok(()),
+    });
+    if let Err(e) = relay {
         eprintln!("ERROR: {e:#}");
         std::process::exit(1);
     }

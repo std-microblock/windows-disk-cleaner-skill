@@ -11,7 +11,7 @@
     disk-cleaner.exe detail D:/Projects --snapshot .disk-cleaner/D.dcscan --depth 2
     disk-cleaner.exe detail D:/Projects/app/target --snapshot .disk-cleaner/D.dcscan --min-size 0 --top 20
 
-- 默认 auto；NTFS/ReFS 严格后端需要管理员权限。加 --elevate 时 CLI 通过 Windows UAC 重新启动自身（一次弹窗），等待子进程并把它的输出原样回传；不加时严格后端直接失败并提示，绝不静默改成 fs。
+- 默认 auto；NTFS/ReFS 严格后端需要管理员权限。加 --elevate 时 CLI 通过 Windows UAC 重新启动自身（一次弹窗），把子进程的 stdout/stderr 实时回传到当前流，并沿用子进程的退出码；输出走命名管道，连不上时退回临时文件，调用方会被明确告知。提权后的进程看不到映射的网络驱动器，因此工作目录必须能被提权进程访问（相对路径的 --plan/--save 依赖当前目录，失败会直接报错）。不加 --elevate 时严格后端直接失败并提示，绝不静默改成 fs。
 - NTFS 直接分块读取 MFT，ReFS 原始扫描当前限定 3.14。其他 ReFS 版本不宣称兼容，使用明确的 --backend fs。
 - --max-memory-mib 1024 限制索引预算；--buffer-mib 8 限制 MFT 批量读取；--threads 1..64。
 - --depth、--top、--min-size、--max-lines 只限制显示，不裁剪完整索引。
